@@ -61,7 +61,13 @@ def check_aic_reconciliation(
     """
     scoped = [r for r in rows if period is None or str(r.get("billing_period")) == period]
     per_user_sum = sum(_to_float(r.get("aic_consumed_usd")) or 0.0 for r in scoped)
-    net = copilot_net_usd(usage_lines)
+    # Scope billing-usage lines to the same month so multi-period runs don't all
+    # compare against the same (full) net total.
+    if period is not None:
+        scoped_lines = [ln for ln in usage_lines if str(getattr(ln, "date", "") or "").startswith(period)]
+    else:
+        scoped_lines = usage_lines
+    net = copilot_net_usd(scoped_lines)
     ok = net <= per_user_sum * (1 + tolerance_frac) + 1e-9
     detail = (
         f"per_user_gross_usd={per_user_sum:.2f}; billing_net_usd={net:.2f} "
