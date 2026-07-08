@@ -68,8 +68,14 @@ By default the tool uses **enterprise-level** endpoints and avoids per-org calls
 seats (`/enterprises/{ent}/copilot/billing/seats`, one paginated call with per-seat
 `organization` attribution), externalIdentities, SCIM, audit log, billing usage, and
 per-user AI-credit usage. Per-org membership/billing/identity calls are opt-in via the
-flags above. If the enterprise seats endpoint is unavailable, the tool falls back to
-discovering orgs and iterating them (skipping orgs that reject the token).
+flags above. If the enterprise seats endpoint is unavailable — e.g. a **standalone
+Copilot enterprise** without the `/enterprises/{ent}` endpoints, or a token lacking
+`manage_billing:copilot`/`read:enterprise` (enterprise-admin) access — the tool falls
+back to discovering organizations and iterating them. When enterprise org discovery is
+also unavailable (GraphQL `enterprise(slug)` returns *Not Found*), it discovers the
+organizations the token itself can access (`GET /user/orgs`) and reports Copilot billing
+for those, skipping any org that rejects the token. This keeps the report non-empty for
+limited tokens; pass `--orgs` to scope to specific organizations.
 
 ### Per-user AI-credit consumption performance
 

@@ -192,11 +192,31 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
             used_enterprise_seats = True
         except (GitHubError, AuthFailure) as exc:
             if getattr(exc, "status", None) in (403, 404):
-                log.warn("enterprise seats endpoint unavailable; falling back to per-org iteration")
+                log.warn(
+                    "enterprise-wide Copilot seats endpoint unavailable "
+                    f"(HTTP {getattr(exc, 'status', '?')}); the token likely lacks "
+                    "'manage_billing:copilot'/'read:enterprise' scope or enterprise-admin "
+                    "access. Falling back to per-org Copilot billing over accessible orgs."
+                )
             else:
                 raise
     if not used_enterprise_seats:
-        iter_orgs = explicit_orgs if explicit_orgs is not None else orgs_src.discover_orgs(client, cfg)
+        if explicit_orgs is not None:
+            iter_orgs = explicit_orgs
+        else:
+            iter_orgs, disc_source = orgs_src.discover_orgs_with_source(client, cfg)
+            if disc_source == "accessible":
+                log.warn(
+                    f"org discovery: scanning {len(iter_orgs)} organization(s) the token can "
+                    "access for Copilot billing (scoped to accessible orgs, not verified "
+                    "enterprise membership; pass --orgs to scope explicitly)"
+                )
+            else:
+                log.warn(
+                    f"org discovery: scanning {len(iter_orgs)} enterprise organization(s) "
+                    "for Copilot billing (skipping orgs that reject the token; pass --orgs "
+                    "to scope explicitly)"
+                )
         for org in iter_orgs:
             # Token passed global preflight, so a per-org 404/403 means Copilot is not
             # enabled for that org (or the org restricts access) — skip, don't abort.
@@ -226,6 +246,31 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
     )
     if skipped_orgs:
         log.warn(f"skipped {len(skipped_orgs)} org(s) without accessible Copilot billing")
+    if not all_seats:
+        if explicit_orgs is not None:
+            print(
+                "[copilot-aic-report] no Copilot seats were found for the specified "
+                "--orgs. Verify the org logins and that the token can read their "
+                "Copilot billing.",
+                file=sys.stderr,
+            )
+        elif used_enterprise_seats:
+            print(
+                "[copilot-aic-report] enterprise-wide seats endpoint returned no seats. "
+                "The enterprise may simply have no assigned Copilot seats for this "
+                "period.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "[copilot-aic-report] no Copilot seats were found for this token. The "
+                "enterprise-wide seat endpoint was unavailable and no accessible "
+                "organization returned seats. For enterprise-wide reporting use a token "
+                "with 'manage_billing:copilot' or 'read:enterprise' scope (and "
+                "enterprise-admin/billing-manager access); otherwise pass --orgs with "
+                "organizations whose Copilot billing this token can read.",
+                file=sys.stderr,
+            )
 
     # -- identities (enterprise-wide + per-org for orgs that HAVE seats) --
     identity_index: Dict[str, str] = {}
