@@ -107,7 +107,7 @@ Required columns (fixed order), then recommended/provenance columns.
 | `gh_copilot_license_cost` | `license_cost_table[plan_type]` (negotiated/config). Org-level actuals from billing-usage are logged. |
 | `default_aic_user_level` | Date-aware `default_aic_table[plan_type]` (credits). `default_aic_usd` = credits × `credit_to_usd`. |
 | `aic_billing_dollar_assigned` | Per-user budget if configured, else `default_aic_user_level × 0.01`. Rule recorded in `aic_assigned_rule_used`. |
-| `aic_consumed` | Per-user consumed AI-credits from the usage report / CSV (`aic_consumed_usd` = ×0.01). `0` if none; empty for historical months with no per-user data. |
+| `aic_consumed` | Per-user **gross** AI-credits consumed from `.../ai_credit/usage?user=` (`grossQuantity`), plus `aic_consumed_usd` (`grossAmount`). This is credits *used*, not the net *billed* amount — usage within the included allowance still counts here even though it bills $0. `0` if none; empty for historical months with no per-user data. |
 | `user_status` | `active` = holds a valid, non-cancelled license; else `inactive` (removed / pending_cancellation / suspended / deprovisioned). |
 | `user_revoked_date` | `pending_cancellation_date` if set, else latest `copilot.seat_cancelled` from audit; empty if active/never-revoked. |
 | `org_login` | Instance (org) login. |
