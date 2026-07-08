@@ -30,9 +30,14 @@ def discover_orgs(client, cfg) -> list[str]:
        a token without ``read:enterprise``. Organizations the token cannot read Copilot
        billing for are skipped later by the caller.
     """
+    return discover_orgs_with_source(client, cfg)[0]
+
+
+def discover_orgs_with_source(client, cfg) -> tuple[list[str], str]:
+    """Return configured/discovered organization logins plus the discovery source."""
     explicit_orgs = cfg.orgs_list()
     if explicit_orgs is not None:
-        return _dedupe(explicit_orgs)
+        return _dedupe(explicit_orgs), "config"
 
     enterprise_slug = cfg.enterprise_slug
     if not enterprise_slug or not str(enterprise_slug).strip():
@@ -40,12 +45,12 @@ def discover_orgs(client, cfg) -> list[str]:
 
     logins, enterprise_visible = _discover_enterprise_orgs(client, enterprise_slug)
     if enterprise_visible:
-        return _dedupe(logins)
+        return _dedupe(logins), "enterprise"
 
     # Enterprise not queryable via GraphQL (standalone Copilot enterprise or a token
     # lacking read:enterprise). Fall back to the token's own accessible organizations
     # so per-org Copilot billing can still be reported.
-    return discover_accessible_orgs(client)
+    return discover_accessible_orgs(client), "accessible"
 
 
 def _discover_enterprise_orgs(client, enterprise_slug: str) -> Tuple[List[str], bool]:
@@ -62,10 +67,10 @@ def _discover_enterprise_orgs(client, enterprise_slug: str) -> Tuple[List[str], 
         try:
             data = client.graphql(ORG_DISCOVERY_QUERY, {"slug": enterprise_slug, "after": after})
         except GraphQLError:
-            break
+            return [], False
         enterprise = (data or {}).get("enterprise")
-        if not enterprise:
-            break
+        if enterprise is None:
+            return logins, enterprise_visible
         enterprise_visible = True
         connection = enterprise.get("organizations") or {}
         for node in connection.get("nodes") or []:

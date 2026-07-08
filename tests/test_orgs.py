@@ -1,7 +1,11 @@
 import pytest
 
 from copilot_aic_report.github_client import GraphQLError
-from copilot_aic_report.sources.orgs import discover_accessible_orgs, discover_orgs
+from copilot_aic_report.sources.orgs import (
+    discover_accessible_orgs,
+    discover_orgs,
+    discover_orgs_with_source,
+)
 
 
 class FakeConfig:
@@ -57,6 +61,7 @@ def test_explicit_org_list_is_returned_deduped_in_order_without_api_calls():
     cfg = FakeConfig(["alpha", "beta", "alpha", "gamma", "beta"])
 
     assert discover_orgs(client, cfg) == ["alpha", "beta", "gamma"]
+    assert discover_orgs_with_source(client, cfg) == (["alpha", "beta", "gamma"], "config")
     assert client.graphql_calls == []
     assert client.rest_calls == []
 
@@ -81,6 +86,18 @@ def test_auto_discovers_orgs_with_graphql_pagination_and_dedupes_in_order():
     assert client.graphql_calls[1][1] == {"slug": "my-enterprise", "after": "c1"}
     # Enterprise was visible, so the REST fallback is not used.
     assert client.rest_calls == []
+
+    source_client = FakeClient(
+        graphql_pages=[
+            _ent_page([{"login": "first"}, {"login": "second"}], has_next=True, cursor="c1"),
+            _ent_page([{"login": "first"}, {"login": "third"}]),
+        ]
+    )
+    assert discover_orgs_with_source(source_client, cfg) == (
+        ["first", "second", "third"],
+        "enterprise",
+    )
+    assert source_client.rest_calls == []
 
 
 @pytest.mark.parametrize("slug", ["", "   ", None])
@@ -116,6 +133,17 @@ def test_falls_back_to_user_orgs_when_enterprise_not_visible():
     assert client.rest_calls == ["/user/orgs"]
 
 
+def test_discovery_source_reports_accessible_fallback():
+    client = FakeClient(
+        graphql_pages=[{"enterprise": None}],
+        rest_orgs=[{"login": "acme"}, {"login": "beta"}, {"login": "acme"}],
+    )
+    cfg = FakeConfig(None, enterprise_slug="ltimghce")
+
+    assert discover_orgs_with_source(client, cfg) == (["acme", "beta"], "accessible")
+    assert client.rest_calls == ["/user/orgs"]
+
+
 def test_falls_back_to_user_orgs_on_graphql_error():
     client = FakeClient(
         graphql_pages=[GraphQLError("enterprise: Not Found")],
@@ -125,6 +153,31 @@ def test_falls_back_to_user_orgs_on_graphql_error():
 
     assert discover_orgs(client, cfg) == ["one", "two"]
     assert client.rest_calls == ["/user/orgs"]
+
+
+def test_graphql_error_after_visible_page_still_falls_back_to_user_orgs():
+    client = FakeClient(
+        graphql_pages=[
+            _ent_page([{"login": "partial"}], has_next=True, cursor="c1"),
+            GraphQLError("enterprise: Not Found"),
+        ],
+        rest_orgs=[{"login": "fallback"}],
+    )
+    cfg = FakeConfig(None, enterprise_slug="ltimghce")
+
+    assert discover_orgs_with_source(client, cfg) == (["fallback"], "accessible")
+    assert client.rest_calls == ["/user/orgs"]
+
+
+def test_empty_enterprise_object_is_treated_as_visible():
+    client = FakeClient(
+        graphql_pages=[{"enterprise": {}}],
+        rest_orgs=[{"login": "fallback"}],
+    )
+    cfg = FakeConfig(None, enterprise_slug="ltimghce")
+
+    assert discover_orgs_with_source(client, cfg) == ([], "enterprise")
+    assert client.rest_calls == []
 
 
 def test_discover_accessible_orgs_dedupes_and_skips_blanks():

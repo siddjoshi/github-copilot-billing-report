@@ -285,6 +285,72 @@ def test_falls_back_to_user_orgs_when_enterprise_inaccessible(tmp_path, monkeypa
     assert any("per-org" in w or "org discovery" in w for w in log.warnings)
 
 
+def test_enterprise_org_discovery_warning_names_enterprise_source(tmp_path, monkeypatch):
+    class EnterpriseDiscoverySession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(404, text='{"message":"Not Found"}')
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": EnterpriseDiscoverySession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    log = cli.run(cfg)
+
+    assert log.rows_written == 1
+    assert any(
+        "org discovery: scanning 1 enterprise organization(s)" in warning
+        and "skipping orgs that reject the token" in warning
+        for warning in log.warnings
+    )
+    assert not any(
+        "not verified enterprise membership" in warning
+        for warning in log.warnings
+        if "org discovery:" in warning
+    )
+
+
+def test_no_seats_message_for_specified_orgs(tmp_path, monkeypatch, capsys):
+    class EmptyExplicitOrgSession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/orgs/empty/copilot/billing/seats" in url:
+                return FakeResponse(200, {"total_seats": 0, "seats": []}, headers={})
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": EmptyExplicitOrgSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    cfg.orgs = ["empty"]
+
+    log = cli.run(cfg)
+    err = capsys.readouterr().err
+
+    assert log.seats_found == 0
+    assert "[copilot-aic-report] no Copilot seats were found for the specified --orgs" in err
+    assert "Verify the org logins" in err
+    assert "enterprise-wide seat endpoint was unavailable" not in err
+
+
+def test_no_seats_message_for_empty_enterprise_endpoint(tmp_path, monkeypatch, capsys):
+    class EmptyEnterpriseSeatSession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(200, {"total_seats": 0, "seats": []}, headers={})
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": EmptyEnterpriseSeatSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+
+    log = cli.run(cfg)
+    err = capsys.readouterr().err
+
+    assert log.seats_found == 0
+    assert "[copilot-aic-report] enterprise-wide seats endpoint returned no seats" in err
+    assert "no assigned Copilot seats for this period" in err
+    assert "enterprise-wide seat endpoint was unavailable" not in err
+
+
 def test_load_identity_map(tmp_path):
     p = tmp_path / "idmap.json"
     p.write_text(
