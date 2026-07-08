@@ -70,34 +70,72 @@ def test_load_from_csv_missing_file_raises_source_unavailable(tmp_path):
         load_from_csv(missing, Config())
 
 
-def test_fetch_from_api_maps_canned_rows_and_sends_period_params():
-    client = FakeClient({"rows": [{"login": "dana", "quantity": "7", "org": "platform"}]})
-    cfg = Config(enterprise_slug="my-ent", billing_period="2026-07", credit_to_usd=0.5)
+def test_fetch_from_api_queries_enterprise_endpoint_and_sums_items():
+    client = FakeClient({"usageItems": [
+        {"product": "copilot", "netQuantity": 5, "netAmount": 0.05},
+        {"product": "copilot", "netQuantity": 3, "netAmount": 0.03},
+    ]})
+    cfg = Config(enterprise_slug="my-ent", billing_period="2026-07", credit_to_usd=0.01)
 
-    rows = fetch_from_api(client, cfg)
+    rows = fetch_from_api(client, cfg, [("platform", "dana")])
 
     assert len(rows) == 1
     assert rows[0].user_login == "dana"
-    assert rows[0].org_login == "platform"
-    assert rows[0].credits_consumed == 7.0
-    assert rows[0].usd_consumed == 3.5
+    assert rows[0].org_login is None  # enterprise-wide per-user consumption
+    assert rows[0].credits_consumed == 8.0
+    assert rows[0].usd_consumed == pytest.approx(0.08)
     assert rows[0].source == "api"
     assert client.calls == [(
-        "/enterprises/my-ent/settings/billing/premium_request/usage",
-        {"year": 2026, "month": 7},
+        "/enterprises/my-ent/settings/billing/ai_credit/usage",
+        {"year": 2026, "month": 7, "user": "dana"},
     )]
 
 
-@pytest.mark.parametrize("exc", [GitHubError("missing", status=404), AuthFailure("forbidden", status=403)])
-def test_fetch_from_api_unavailable_errors_raise_source_unavailable(exc):
-    with pytest.raises(AicSourceUnavailable):
-        fetch_from_api(FakeClient(exc=exc), Config(enterprise_slug="ent", billing_period="2026-07"))
+def test_fetch_from_api_dedupes_logins_across_orgs():
+    client = FakeClient({"usageItems": [{"netQuantity": 10, "netAmount": 0.1}]})
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07")
+    # Same login in two orgs -> queried once (enterprise-wide).
+    rows = fetch_from_api(client, cfg, [("org-a", "dana"), ("org-b", "dana")])
+    assert len(rows) == 1
+    assert len(client.calls) == 1
 
 
-def test_fetch_from_api_returns_empty_for_unrecognized_shape():
-    rows = fetch_from_api(FakeClient({"not_rows": [{"credits": 1}]}), Config(enterprise_slug="ent"))
+def test_fetch_from_api_derives_usd_when_amount_absent():
+    client = FakeClient({"usageItems": [{"netQuantity": 100}]})
+    cfg = Config(billing_period="2026-07", credit_to_usd=0.01)
+    rows = fetch_from_api(client, cfg, [("org", "u")])
+    assert rows[0].credits_consumed == 100.0
+    assert rows[0].usd_consumed == pytest.approx(1.0)
 
+
+def test_fetch_from_api_skips_users_with_zero_consumption():
+    client = FakeClient({"usageItems": [{"netQuantity": 0, "netAmount": 0}]})
+    rows = fetch_from_api(client, Config(billing_period="2026-07"), [("org", "u")])
     assert rows == []
+
+
+def test_fetch_from_api_all_orgs_unavailable_raises():
+    # Every org 404s -> source unavailable so callers can fall back to CSV.
+    with pytest.raises(AicSourceUnavailable):
+        fetch_from_api(FakeClient(exc=GitHubError("missing", status=404)),
+                       Config(billing_period="2026-07"), [("org", "u")])
+
+
+def test_fetch_from_api_auth_failure_raises_unavailable():
+    with pytest.raises(AicSourceUnavailable):
+        fetch_from_api(FakeClient(exc=AuthFailure("forbidden", status=403)),
+                       Config(billing_period="2026-07"), [("org", "u")])
+
+
+def test_fetch_from_api_enterprise_endpoint_404_raises_unavailable():
+    # The enterprise endpoint is a single endpoint; a 404 means unavailable.
+    with pytest.raises(AicSourceUnavailable):
+        fetch_from_api(FakeClient(exc=GitHubError("missing", status=404)),
+                       Config(enterprise_slug="ent", billing_period="2026-07"), [("org", "x")])
+
+
+def test_fetch_from_api_no_holders_returns_empty():
+    assert fetch_from_api(FakeClient({"usageItems": []}), Config(billing_period="2026-07"), []) == []
 
 
 def test_get_consumption_prefers_csv_when_path_is_set_even_if_api_enabled(tmp_path):
@@ -105,8 +143,9 @@ def test_get_consumption_prefers_csv_when_path_is_set_even_if_api_enabled(tmp_pa
     csv_path.write_text("user,credits\nerin,3\n", encoding="utf-8")
 
     rows, source = get_consumption(
-        FakeClient(payload={"rows": [{"login": "api-user", "quantity": 10}]}),
+        FakeClient(payload={"usageItems": [{"netQuantity": 10}]}),
         Config(aic_consumption_csv_path=str(csv_path), aic_consumption_api_enabled=True),
+        [("org", "api-user")],
     )
 
     assert source == "csv"
@@ -115,22 +154,34 @@ def test_get_consumption_prefers_csv_when_path_is_set_even_if_api_enabled(tmp_pa
 
 def test_get_consumption_uses_api_when_enabled_without_csv_path():
     rows, source = get_consumption(
-        FakeClient(payload={"rows": [{"user": "frank", "credits": 2}]}),
-        Config(enterprise_slug="ent", aic_consumption_api_enabled=True, aic_consumption_csv_path=None),
+        FakeClient(payload={"usageItems": [{"netQuantity": 2, "netAmount": 0.02}]}),
+        Config(billing_period="2026-07", aic_consumption_api_enabled=True, aic_consumption_csv_path=None),
+        [("eng", "frank")],
     )
 
     assert source == "api"
     assert [row.user_login for row in rows] == ["frank"]
 
 
+def test_get_consumption_none_without_holders():
+    rows, source = get_consumption(
+        FakeClient(payload={"usageItems": [{"netQuantity": 2}]}),
+        Config(aic_consumption_api_enabled=True, aic_consumption_csv_path=None),
+        [],
+    )
+    assert rows == []
+    assert source == "none"
+
+
 def test_get_consumption_returns_none_when_api_unavailable_and_csv_missing(tmp_path):
     rows, source = get_consumption(
         FakeClient(exc=GitHubError("gone", status=410)),
         Config(
-            enterprise_slug="ent",
+            billing_period="2026-07",
             aic_consumption_api_enabled=True,
             aic_consumption_csv_path=str(tmp_path / "missing.csv"),
         ),
+        [("org", "u")],
     )
 
     assert rows == []
@@ -139,8 +190,9 @@ def test_get_consumption_returns_none_when_api_unavailable_and_csv_missing(tmp_p
 
 def test_get_consumption_returns_none_when_no_sources_configured():
     rows, source = get_consumption(
-        FakeClient(payload={"rows": [{"user": "ignored", "credits": 1}]}),
+        FakeClient(payload={"usageItems": [{"netQuantity": 1}]}),
         Config(aic_consumption_api_enabled=False, aic_consumption_csv_path=None),
+        [("org", "ignored")],
     )
 
     assert rows == []

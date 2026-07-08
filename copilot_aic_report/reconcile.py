@@ -76,12 +76,10 @@ def check_real_logins(rows: List[Dict[str, object]]) -> Dict[str, object]:
 
 
 def check_no_external_in_login(rows: List[Dict[str, object]]) -> Dict[str, object]:
-    """Must be zero rows where user_login contains an external identity (@ or space)."""
-    leaks = [
-        r
-        for r in rows
-        if (lambda s: "@" in s or " " in s)(str(r.get("user_login") or ""))
-    ]
+    """Must be zero rows where user_login holds an external identity (email/NameID/GUID)."""
+    from .resolve import looks_like_external_id
+
+    leaks = [r for r in rows if looks_like_external_id(str(r.get("user_login") or ""))]
     ok = len(leaks) == 0
     sample = [str(r.get("user_login")) for r in leaks[:5]]
     return {

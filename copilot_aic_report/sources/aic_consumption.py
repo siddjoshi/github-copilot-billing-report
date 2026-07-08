@@ -41,33 +41,75 @@ def load_from_csv(path: Any, cfg: Any) -> list[AicConsumption]:
     return rows
 
 
-def fetch_from_api(client: Any, cfg: Any) -> list[AicConsumption]:
-    """Best-effort load from GitHub's per-user premium request usage report API."""
+def fetch_from_api(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> list[AicConsumption]:
+    """Load per-user AIC consumption from GitHub's enterprise per-user AI-credit report.
+
+    Uses ``GET /enterprises/{ent}/settings/billing/ai_credit/usage?user={login}`` — an
+    enterprise-level endpoint that works regardless of per-org classic-PAT restrictions
+    and needs only one call per unique user (not per org+user). AIC is pooled/consumed
+    per user at the billing-entity level, so the result is org-agnostic
+    (``org_login=None``). Sums ``netQuantity`` (credits) and ``netAmount`` (USD).
+
+    Raises :class:`AicSourceUnavailable` if the endpoint is not available at all
+    (so callers can fall back to a CSV export).
+    """
     period = cfg.resolve_billing_period()
     year_text, month_text = period.split("-", 1)
-    endpoint = f"/enterprises/{cfg.enterprise_slug}/settings/billing/premium_request/usage"
+    params_base = {"year": int(year_text), "month": int(month_text)}
+    endpoint = f"/enterprises/{cfg.enterprise_slug}/settings/billing/ai_credit/usage"
 
-    try:
-        # This endpoint is a plausible default and must be CONFIRMED at run time;
-        # GitHub Enterprise availability, path, and response shape may vary.
-        payload = client.get(endpoint, params={"year": int(year_text), "month": int(month_text)})
-    except AuthFailure as exc:
-        raise AicSourceUnavailable("AIC consumption API is not available") from exc
-    except GitHubError as exc:
-        if exc.status in (403, 404, 410):
-            raise AicSourceUnavailable("AIC consumption API is not available") from exc
-        raise
+    # Unique logins across the (org, login) holders.
+    logins: list[str] = []
+    seen: set = set()
+    for _org, login in holders:
+        if login and str(login).lower() not in seen:
+            seen.add(str(login).lower())
+            logins.append(login)
 
-    return [
-        row
-        for row in (_map_row(item, cfg, source="api") for item in _iter_api_rows(payload))
-        if row is not None
-    ]
+    rows: list[AicConsumption] = []
+    any_success = False
+    for login in logins:
+        try:
+            payload = client.get(endpoint, params={**params_base, "user": login})
+        except AuthFailure as exc:
+            raise AicSourceUnavailable("AIC consumption API is not accessible") from exc
+        except GitHubError as exc:
+            if exc.status in (403, 404, 410):
+                # Enterprise endpoint unavailable entirely -> stop and signal fallback.
+                raise AicSourceUnavailable("enterprise AIC usage endpoint unavailable") from exc
+            raise
+        any_success = True
+        items = payload.get("usageItems") if isinstance(payload, dict) else None
+        if not items:
+            continue
+        credits = sum(_to_float(item.get("netQuantity")) for item in items)
+        usd = sum(_to_float(item.get("netAmount")) for item in items)
+        if credits == 0 and usd == 0:
+            continue
+        rows.append(
+            AicConsumption(
+                user_login=str(login).strip(),
+                org_login=None,  # enterprise-wide per-user consumption
+                credits_consumed=credits,
+                usd_consumed=usd if usd else credits * float(cfg.credit_to_usd),
+                source="api",
+                raw={"user": login, "usage_items": len(items)},
+            )
+        )
+
+    if not any_success and logins:
+        raise AicSourceUnavailable("no AIC usage retrieved")
+    return rows
 
 
-def get_consumption(client: Any, cfg: Any) -> tuple[list[AicConsumption], str]:
-    """Return AIC consumption rows and the source used: ``csv``, ``api``, or ``none``."""
+def get_consumption(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> tuple[list[AicConsumption], str]:
+    """Return AIC consumption rows and the source used: ``csv``, ``api``, or ``none``.
+
+    Precedence: a configured CSV export first (authoritative, works for historical
+    months), else the per-user API for the given ``holders``.
+    """
     csv_path = cfg.aic_consumption_csv_path
+    holders = list(holders)
 
     if csv_path:
         try:
@@ -75,9 +117,9 @@ def get_consumption(client: Any, cfg: Any) -> tuple[list[AicConsumption], str]:
         except AicSourceUnavailable:
             pass
 
-    if cfg.aic_consumption_api_enabled:
+    if cfg.aic_consumption_api_enabled and holders:
         try:
-            return fetch_from_api(client, cfg), "api"
+            return fetch_from_api(client, cfg, holders), "api"
         except AicSourceUnavailable:
             if csv_path:
                 try:

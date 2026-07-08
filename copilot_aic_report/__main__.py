@@ -59,6 +59,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fetch-membership", dest="fetch_membership", action="store_true", default=None,
                    help="Fetch each org's member list (one call/org) for stricter account-state detection. "
                         "Default: enterprise-SCIM-only, seat holders assumed members.")
+    p.add_argument("--fetch-org-billing", dest="fetch_org_billing", action="store_true", default=None,
+                   help="Fetch per-org Copilot billing summary (one call/org) for seat_breakdown reconciliation. "
+                        "Default off: plan_type comes from the enterprise seats payload.")
+    p.add_argument("--fetch-org-identities", dest="fetch_org_identities", action="store_true", default=None,
+                   help="Fetch per-org SAML identities (one call/org). Default off: enterprise externalIdentities used.")
     p.add_argument("--allow-partial-scopes", action="store_true", help="Warn (not fail) on missing optional scopes.")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
@@ -78,6 +83,8 @@ def _overrides_from_args(args: argparse.Namespace) -> Dict[str, object]:
         "identity_map_path",
         "aic_consumption_csv_path",
         "fetch_membership",
+        "fetch_org_billing",
+        "fetch_org_identities",
     ):
         val = getattr(args, key, None)
         if val is not None:
@@ -173,11 +180,54 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
         if period < earliest and period not in snap_months:
             log.warn(f"period {period} predates recoverable window ({earliest}); best-effort / aggregate-only")
 
-    # -- discover orgs --
-    org_logins = orgs_src.discover_orgs(client, cfg)
-    log.orgs_scanned = list(org_logins)
+    # -- fetch seats: prefer the enterprise-wide endpoint (one paginated call,
+    #    not subject to per-org classic-PAT restrictions); fall back to per-org. --
+    explicit_orgs = cfg.orgs_list()
+    all_seats = []
+    skipped_orgs: List[str] = []
+    used_enterprise_seats = False
+    if explicit_orgs is None:
+        try:
+            all_seats = seats_src.fetch_enterprise_seats(client, cfg)
+            used_enterprise_seats = True
+        except (GitHubError, AuthFailure) as exc:
+            if getattr(exc, "status", None) in (403, 404):
+                log.warn("enterprise seats endpoint unavailable; falling back to per-org iteration")
+            else:
+                raise
+    if not used_enterprise_seats:
+        iter_orgs = explicit_orgs if explicit_orgs is not None else orgs_src.discover_orgs(client, cfg)
+        for org in iter_orgs:
+            # Token passed global preflight, so a per-org 404/403 means Copilot is not
+            # enabled for that org (or the org restricts access) — skip, don't abort.
+            try:
+                all_seats.extend(seats_src.fetch_seats(client, cfg, org))
+            except (GitHubError, AuthFailure) as exc:
+                if getattr(exc, "status", None) in (403, 404):
+                    skipped_orgs.append(org)
+                    continue
+                raise
 
-    # -- identities (optional) --
+    # Attribute seats to orgs and derive the org set from the seats themselves.
+    seat_logins_by_org: Dict[str, set] = {}
+    org_plan_by_org: Dict[str, str] = {}
+    for seat in all_seats:
+        seat_logins_by_org.setdefault(seat.org_login, set())
+        if seat.assignee_login:
+            seat_logins_by_org[seat.org_login].add(seat.assignee_login)
+        if seat.plan_type and seat.org_login not in org_plan_by_org:
+            org_plan_by_org[seat.org_login] = seat.plan_type
+    org_logins = sorted(o for o in seat_logins_by_org if o)
+    log.orgs_scanned = list(org_logins)
+    log.seats_found = len(all_seats)
+    log.warn(
+        f"seat source: {'enterprise-wide endpoint' if used_enterprise_seats else 'per-org iteration'}; "
+        f"{len(all_seats)} seats across {len(org_logins)} org(s)"
+    )
+    if skipped_orgs:
+        log.warn(f"skipped {len(skipped_orgs)} org(s) without accessible Copilot billing")
+
+    # -- identities (enterprise-wide + per-org for orgs that HAVE seats) --
     identity_index: Dict[str, str] = {}
     if optional_report.satisfied.get("identity"):
         try:
@@ -188,7 +238,8 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
             idents = []
             log.warn(f"enterprise identity fetch failed: {exc}")
         for org in org_logins:
-            # Per-org identity providers may be inaccessible; skip individually.
+            if not cfg.fetch_org_identities:
+                break
             try:
                 idents.extend(identities.fetch_org_identities(client, cfg, org))
             except (GitHubError, AuthFailure) as exc:
@@ -200,45 +251,27 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
         identity_index = identities.build_identity_index(idents)
     resolver = IdentityResolver(identity_index=identity_index, identity_map=load_identity_map(cfg.identity_map_path))
 
-    # -- ledger ingestion --
+    # -- ledger ingestion (identities are ready, so GUID logins resolve) --
     ledger = SeatLedger(resolver=resolver)
     for event in archive_events:
         ledger.add_audit_event(event)
+    for seat in all_seats:
+        ledger.add_live_seat(seat)
 
-    all_seats = []
-    org_plan_by_org: Dict[str, str] = {}
+    # -- org billing summary (opt-in; per-org). Off by default: plan_type comes from
+    #    the enterprise seats payload. Enable for seat_breakdown reconciliation. --
     org_billing_map = {}
-    seat_logins_by_org: Dict[str, set] = {}
-    skipped_orgs: List[str] = []
-    for org in org_logins:
-        # The token passed global preflight, so a per-org 404/403 means Copilot is
-        # not enabled for that org, or the org restricts access — skip it, don't abort.
-        try:
-            seats = seats_src.fetch_seats(client, cfg, org)
-        except (GitHubError, AuthFailure) as exc:
-            status = getattr(exc, "status", None)
-            if status in (403, 404):
-                skipped_orgs.append(org)
-                log.warn(f"skipped org '{org}' (seats {status}: Copilot not enabled or access restricted)")
-                continue
-            raise
-        all_seats.extend(seats)
-        seat_logins_by_org[org] = {s.assignee_login for s in seats if s.assignee_login}
-        for seat in seats:
-            ledger.add_live_seat(seat)
-        try:
-            summary = org_billing_src.fetch_org_billing(client, cfg, org)
-            org_billing_map[org] = summary
-            if summary.plan_type:
-                org_plan_by_org[org] = summary.plan_type
-        except (GitHubError, AuthFailure) as exc:
-            if getattr(exc, "status", None) in (403, 404):
-                log.warn(f"org '{org}' billing summary unavailable ({getattr(exc, 'status', None)})")
-            else:
+    if cfg.fetch_org_billing:
+        for org in org_logins:
+            try:
+                summary = org_billing_src.fetch_org_billing(client, cfg, org)
+                org_billing_map[org] = summary
+                if summary.plan_type and org not in org_plan_by_org:
+                    org_plan_by_org[org] = summary.plan_type
+            except (GitHubError, AuthFailure) as exc:
+                if getattr(exc, "status", None) in (403, 404):
+                    continue
                 raise
-    log.seats_found = len(all_seats)
-    if skipped_orgs:
-        log.warn(f"skipped {len(skipped_orgs)} org(s) without accessible Copilot billing")
 
     # -- audit API events (optional) --
     if optional_report.satisfied.get("audit_log"):
@@ -287,10 +320,22 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
             log.warn(f"billing-usage fetch failed: {exc}")
 
     # -- per-user AIC consumption --
-    consumption_rows, consumption_source = aic_consumption.get_consumption(client, cfg)
+    aic_holders = ledger.live_seat_holders()
+    consumption_rows, consumption_source = aic_consumption.get_consumption(client, cfg, aic_holders)
     log.aic_consumption_source = consumption_source
     consumption_index = index_consumption(consumption_rows)
     per_user_has_consumption = consumption_source != "none"
+    if per_user_has_consumption:
+        log.warn(
+            f"per-user AIC consumption source='{consumption_source}': "
+            f"{len(consumption_rows)} user row(s) with consumption for {len(aic_holders)} seat holder(s)"
+        )
+    else:
+        log.warn(
+            "per-user AIC consumption unavailable (no CSV configured and the per-user "
+            "org billing endpoint returned nothing/forbidden); aic_consumed left empty. "
+            "Provide --aic-csv or ensure the token can read org AI-credit billing."
+        )
 
     # -- materialize + build rows per period --
     all_rows: List[Dict[str, object]] = []

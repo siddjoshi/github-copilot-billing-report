@@ -13,10 +13,17 @@ userName, or email). Resolution precedence:
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from .models import ExternalIdentity, IdentityMapEntry
+
+# A suspended/deprovisioned EMU account often surfaces with a GUID-form login
+# (a UUID, optionally followed by an ``_shortcode`` suffix) instead of a real handle.
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 
 def _norm(value: Optional[str]) -> Optional[str]:
@@ -137,4 +144,21 @@ def looks_like_external_id(value: Optional[str]) -> bool:
     """Heuristic: does ``value`` look like an email / NameID rather than a login?"""
     if not value:
         return False
-    return "@" in value or " " in value
+    return "@" in value or " " in value or is_placeholder_login(value)
+
+
+def is_placeholder_login(login: Optional[str]) -> bool:
+    """True if ``login`` is a GUID-form placeholder (suspended/deprovisioned EMU
+    account) rather than a real GitHub handle. Matches a UUID anywhere in the
+    string, so ``<uuid>`` and ``<uuid>_shortcode`` are both detected."""
+    if not login:
+        return False
+    return bool(_UUID_RE.search(str(login)))
+
+
+def extract_guid(login: Optional[str]) -> Optional[str]:
+    """Return the bare UUID from a GUID-form login (dropping any ``_shortcode``)."""
+    if not login:
+        return None
+    match = _UUID_RE.search(str(login))
+    return match.group(0) if match else None

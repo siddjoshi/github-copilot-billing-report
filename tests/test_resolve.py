@@ -4,6 +4,7 @@ from copilot_aic_report.resolve import (
     Resolution,
     canonicalize_login,
     emu_shortname,
+    is_placeholder_login,
     looks_like_external_id,
 )
 
@@ -85,3 +86,22 @@ def test_looks_like_external_id():
     assert looks_like_external_id("First Last")
     assert not looks_like_external_id("mona_acme")
     assert not looks_like_external_id(None)
+
+
+def test_is_placeholder_login_detects_guid():
+    assert is_placeholder_login("2f1c8e4a-1234-4abc-9def-0123456789ab")
+    assert is_placeholder_login("2f1c8e4a-1234-4abc-9def-0123456789ab_acme")  # with EMU suffix
+    assert not is_placeholder_login("mona_acme")
+    assert not is_placeholder_login("octocat")
+    assert not is_placeholder_login(None)
+
+
+def test_looks_like_external_id_flags_guid():
+    assert looks_like_external_id("2f1c8e4a-1234-4abc-9def-0123456789ab_acme")
+
+
+def test_resolve_guid_via_external_index():
+    r = IdentityResolver(identity_index={"2f1c8e4a-1234-4abc-9def-0123456789ab": "mona_acme"})
+    res = r.resolve(external_id="2f1c8e4a-1234-4abc-9def-0123456789ab")
+    assert res.user_login == "mona_acme"
+    assert res.source == "externalIdentities"

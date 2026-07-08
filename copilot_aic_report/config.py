@@ -122,11 +122,13 @@ class Config:
     aic_consumption_api_enabled: bool = True
     aic_consumption_csv_path: Optional[str] = None
 
-    # Membership fetching is per-org and optional. When False (default), account
-    # state is derived from enterprise-level SCIM + audit only; seat holders are
-    # assumed org members. Enable to fetch each org's member list for stricter
-    # membership/account-state detection at the cost of one call per org.
+    # Per-org API calls are opt-in to minimize requests; enterprise-level endpoints
+    # are preferred. When these are False (default): plan_type comes from the
+    # enterprise seats payload, identities from enterprise externalIdentities, and
+    # account state from enterprise SCIM.
     fetch_membership: bool = False
+    fetch_org_billing: bool = False
+    fetch_org_identities: bool = False
 
     # Output / logging
     output_path: str = "copilot_aic_report.csv"

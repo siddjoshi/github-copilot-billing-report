@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .models import AuditEvent, Seat
 from .periods import cycle_bounds_utc, interval_overlaps_period
-from .resolve import IdentityResolver, canonicalize_login
+from .resolve import IdentityResolver, canonicalize_login, extract_guid, is_placeholder_login
 from .util import epoch_ms_to_utc_datetime, to_utc_datetime
 
 ASSIGN_SUFFIXES = ("seat_assigned", "seat_refresh")
@@ -55,6 +55,7 @@ class MaterializedSeat:
     assigned_via: Optional[str] = None
     seat: Optional[Seat] = None
     snapshot_record: Optional[dict] = None
+    suspended: bool = False
     notes: List[str] = field(default_factory=list)
 
 
@@ -69,6 +70,7 @@ class _Holder:
     assigns: List[_dt.datetime] = field(default_factory=list)
     cancels: List[_dt.datetime] = field(default_factory=list)
     live_seat: Optional[Seat] = None
+    suspended: bool = False
 
 
 class SeatLedger:
@@ -128,7 +130,27 @@ class SeatLedger:
         if not seat.org_login:
             return
         login = seat.assignee_login
-        holder = self._holder(login, seat.org_login, None, source="seat")
+        if login and is_placeholder_login(login):
+            # Suspended/deprovisioned EMU account: the seat carries a GUID placeholder
+            # instead of a real handle. Resolve the real login via externalIdentities /
+            # identity_map so audit and AIC data (keyed by real login) can merge; never
+            # treat the GUID as a real login.
+            resolution = self.resolver.resolve(external_id=login)
+            if not resolution.user_login:
+                core = extract_guid(login)
+                if core and core != login:
+                    resolution = self.resolver.resolve(external_id=core)
+            holder = self._holder(
+                resolution.user_login,
+                seat.org_login,
+                external_id=login,
+                source=resolution.source if resolution.user_login else "seat",
+            )
+            holder.suspended = True
+            if not holder.external_identity:
+                holder.external_identity = login
+        else:
+            holder = self._holder(login, seat.org_login, None, source="seat")
         holder.live_seat = seat
         assigned = to_utc_datetime(seat.created_at)
         if assigned is not None:
@@ -136,6 +158,18 @@ class SeatLedger:
 
     def add_snapshot(self, period: str, records: List[dict]) -> None:
         self.snapshots[period] = list(records or [])
+
+    def live_seat_holders(self) -> List[tuple]:
+        """Return ``(org, login)`` pairs for current live seats with a real login.
+
+        Used to query per-user AIC consumption by the resolved GitHub login (never
+        a GUID placeholder).
+        """
+        out: List[tuple] = []
+        for holder in self._holders.values():
+            if holder.live_seat is not None and holder.login:
+                out.append((holder.org, holder.login))
+        return out
 
     # -- interval construction -------------------------------------------
 
@@ -236,10 +270,17 @@ class SeatLedger:
 
         login = holder.login
         login_source = holder.login_source
-        external_identity = None if login else holder.external_identity
+        # Preserve the external identity (e.g. suspended EMU GUID) even when a real
+        # login was recovered, so it is visible in the external_identity column.
+        external_identity = holder.external_identity
         if not login:
             login_source = "UNRECOVERABLE"
             notes.append("login unrecoverable; external identity retained separately")
+
+        # Suspended/deprovisioned account -> inactive regardless of seat state.
+        if holder.suspended:
+            user_status = "inactive"
+            notes.append("account suspended/deprovisioned (GUID placeholder login)")
 
         assigned_date = interval.assigned_at.date().isoformat() if interval.assigned_at else ""
         if interval.assigned_at is None:
@@ -263,6 +304,7 @@ class SeatLedger:
             last_activity_at=seat.last_activity_at if seat else None,
             assigned_via=(f"team:{seat.assigning_team_slug}" if seat and seat.assigning_team_slug else ("direct" if seat else None)),
             seat=seat,
+            suspended=holder.suspended,
             notes=notes,
         )
 

@@ -69,6 +69,9 @@ def build_rows(
 
     rows: List[Dict[str, object]] = []
     seen: set = set()
+    # AIC consumption is enterprise-wide per user; assign it to only the first
+    # (login, period) row so multi-org users are not double-counted.
+    consumed_assigned: set = set()
     for seat in materialized:
         login = seat.user_login
         org = seat.org_login
@@ -102,15 +105,23 @@ def build_rows(
             aic_assigned_usd = default_usd
             rule = "plan_default"
 
-        # AIC consumed (per-user).
+        # AIC consumed (per-user, enterprise-wide). Attribute to the first org row
+        # for this (login, period) to avoid double-counting across a user's orgs.
         consumed = _lookup_consumption(consumption_index, login, org)
-        if consumed is not None:
+        consume_key = ((login or "").lower(), period)
+        already_assigned = consume_key in consumed_assigned
+        if consumed is not None and not already_assigned:
+            consumed_assigned.add(consume_key)
             aic_consumed_credits: Optional[float] = consumed.credits_consumed
             aic_consumed_usd: Optional[float] = (
                 consumed.usd_consumed
                 if consumed.usd_consumed is not None
                 else consumed.credits_consumed * rate
             )
+        elif consumed is not None and already_assigned:
+            aic_consumed_credits = 0.0
+            aic_consumed_usd = 0.0
+            notes.append("AIC consumption attributed to another org row for this user")
         elif per_user_has_consumption:
             aic_consumed_credits = 0.0
             aic_consumed_usd = 0.0
@@ -129,6 +140,11 @@ def build_rows(
             user_status = "inactive"
             if "deprovisioned/suspended account -> inactive" not in notes:
                 notes.append("deprovisioned/suspended account -> inactive")
+        # A GUID-placeholder seat is an authoritative suspension signal even when
+        # SCIM/membership data is unavailable.
+        if getattr(seat, "suspended", False):
+            user_status = "inactive"
+            account_state = "suspended"
 
         identity_resolution_source = _RESOLUTION_MAP.get(
             seat.login_recovery_source, seat.login_recovery_source

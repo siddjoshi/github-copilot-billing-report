@@ -110,3 +110,55 @@ def test_unrecoverable_via_external_only():
     rows = led.materialize_month("2026-07", "now")
     assert rows[0].user_login is None
     assert rows[0].login_recovery_source == "UNRECOVERABLE"
+
+
+_GUID = "2f1c8e4a-1234-4abc-9def-0123456789ab"
+
+
+def test_suspended_guid_seat_resolved_and_inactive():
+    # Suspended EMU account surfaces as a GUID login; resolver maps it to the real
+    # login. Must be inactive, real login output, GUID kept in external_identity.
+    resolver = IdentityResolver(identity_index={_GUID: "mona_acme"})
+    led = SeatLedger(resolver=resolver)
+    led.add_live_seat(_seat(_GUID + "_acme", "acme", "2026-03-01T00:00:00Z"))
+    rows = led.materialize_month("2026-07", "now")
+    r = rows[0]
+    assert r.user_login == "mona_acme"          # real login, not the GUID
+    assert r.suspended is True
+    assert r.user_status == "inactive"
+    assert r.external_identity == _GUID + "_acme"
+    assert r.login_recovery_source == "externalIdentities"
+
+
+def test_suspended_guid_unresolved_does_not_leak_guid():
+    led = SeatLedger()  # no identity mapping
+    led.add_live_seat(_seat(_GUID, "acme", "2026-03-01T00:00:00Z"))
+    rows = led.materialize_month("2026-07", "now")
+    r = rows[0]
+    assert r.user_login is None                  # GUID never leaks into user_login
+    assert r.external_identity == _GUID
+    assert r.user_status == "inactive"
+    assert r.login_recovery_source == "UNRECOVERABLE"
+
+
+def test_suspended_guid_merges_audit_revoke():
+    # After resolving the GUID to the real login, an audit seat_cancelled for that
+    # real login merges into the same interval, producing a revoke date.
+    resolver = IdentityResolver(identity_index={_GUID: "mona_acme"})
+    led = SeatLedger(resolver=resolver)
+    led.add_live_seat(_seat(_GUID, "acme", "2026-01-01T00:00:00Z"))
+    led.add_audit_event(AuditEvent("copilot.seat_cancelled", "mona_acme", "acme", _ms(2026, 6, 15)))
+    rows = led.materialize_month("2026-06", "now")
+    r = rows[0]
+    assert r.user_login == "mona_acme"
+    assert r.user_revoked_date == "2026-06-15"
+
+
+def test_live_seat_holders_uses_real_login():
+    resolver = IdentityResolver(identity_index={_GUID: "mona_acme"})
+    led = SeatLedger(resolver=resolver)
+    led.add_live_seat(_seat(_GUID, "acme", "2026-03-01T00:00:00Z"))
+    led.add_live_seat(_seat("octo", "globex", "2026-03-01T00:00:00Z"))
+    holders = set(led.live_seat_holders())
+    assert ("acme", "mona_acme") in holders
+    assert ("globex", "octo") in holders

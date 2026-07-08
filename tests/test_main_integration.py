@@ -53,6 +53,22 @@ class RoutingSession:
         # REST — dispatch by path fragments
         if "/rate_limit" in url:
             return FakeResponse(200, {"resources": {}}, headers={"X-OAuth-Scopes": self.SCOPES})
+        if "/ai_credit/usage" in url or "/premium_request/usage" in url:
+            # Enterprise per-user AIC endpoint — no consumption by default.
+            return FakeResponse(200, {"timePeriod": {"year": 2026, "month": 7}, "user": (params or {}).get("user"), "usageItems": []})
+        if "/enterprises/" in url and "/copilot/billing/seats" in url:
+            # Enterprise-wide seats endpoint (preferred path) with org attribution.
+            return FakeResponse(200, {"total_seats": 1, "seats": [{
+                "assignee": {"login": "mona_acme", "id": 5, "type": "User"},
+                "organization": {"login": "acme"},
+                "created_at": "2026-03-01T00:00:00Z",
+                "pending_cancellation_date": None,
+                "last_activity_at": "2026-07-01T00:00:00Z",
+                "last_authenticated_at": "2026-07-01T00:00:00Z",
+                "last_activity_editor": "vscode",
+                "assigning_team": None,
+                "plan_type": "business",
+            }]}, headers={})
         if "/copilot/billing/seats" in url:
             return FakeResponse(200, {"total_seats": 1, "seats": [{
                 "assignee": {"login": "mona_acme", "id": 5, "type": "User"},
@@ -76,8 +92,6 @@ class RoutingSession:
             ]})
         if "/audit-log" in url:
             return FakeResponse(200, [], headers={})
-        if "/premium_request/usage" in url:
-            return FakeResponse(404, text="not found")
         return FakeResponse(404, text=f"unrouted {url}")
 
 
@@ -315,6 +329,8 @@ def test_membership_fetched_when_enabled(tmp_path, monkeypatch):
 def test_partial_graphql_errors_logged(tmp_path, monkeypatch):
     class PartialSession(RoutingSession):
         def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(404, text='{"message":"Not Found"}')  # force per-org fallback
             if url.endswith("/graphql"):
                 q = (json or {}).get("query", "")
                 if "organizations" in q:
@@ -337,9 +353,11 @@ def test_partial_graphql_errors_logged(tmp_path, monkeypatch):
 
 
 def test_org_seats_404_is_skipped(tmp_path, monkeypatch):
-    # An enterprise with a mix of orgs: one with Copilot, one returning 404 on seats.
+    # Force per-org fallback (enterprise seats 404), with one org lacking Copilot.
     class MixedSession(RoutingSession):
         def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(404, text='{"message":"Not Found"}')
             if url.endswith("/graphql"):
                 q = (json or {}).get("query", "")
                 if "organizations" in q:
@@ -357,12 +375,14 @@ def test_org_seats_404_is_skipped(tmp_path, monkeypatch):
     log = cli.run(cfg)
     # acme still produces its row; no-copilot is skipped, not fatal.
     assert log.rows_written == 1
-    assert any("skipped org 'no-copilot'" in w for w in log.warnings)
+    assert any("skipped 1 org" in w for w in log.warnings)
 
 
 def test_org_seats_403_is_skipped(tmp_path, monkeypatch):
     class ForbidSession(RoutingSession):
         def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(404, text='{"message":"Not Found"}')
             if url.endswith("/graphql"):
                 q = (json or {}).get("query", "")
                 if "organizations" in q:
@@ -379,4 +399,89 @@ def test_org_seats_403_is_skipped(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path)
     log = cli.run(cfg)
     assert log.rows_written == 1
-    assert any("skipped org 'restricted'" in w for w in log.warnings)
+    assert any("skipped 1 org" in w for w in log.warnings)
+
+
+def test_enterprise_seats_preferred_no_per_org_seat_calls(tmp_path, monkeypatch):
+    # Default path: enterprise seats endpoint used; no per-org seat calls made.
+    class TrackingSession(RoutingSession):
+        def __init__(self):
+            self.org_seat_calls = 0
+            self.enterprise_seat_calls = 0
+
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                self.enterprise_seat_calls += 1
+            elif "/orgs/" in url and "/copilot/billing/seats" in url:
+                self.org_seat_calls += 1
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": TrackingSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    log = cli.run(cfg)
+    assert holder["session"].enterprise_seat_calls >= 1
+    assert holder["session"].org_seat_calls == 0
+    assert log.rows_written == 1
+    with open(cfg.output_path, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows[0]["org_login"] == "acme"  # org attribution from enterprise seat
+
+
+def test_suspended_guid_user_live_end_to_end(tmp_path, monkeypatch):
+    # A suspended EMU user surfaces with a GUID login on the enterprise seats endpoint.
+    guid = "2f1c8e4a-1234-4abc-9def-0123456789ab"
+
+    class SuspendedSession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if url.endswith("/graphql"):
+                q = (json or {}).get("query", "")
+                if "ownerInfo" in q:
+                    return FakeResponse(200, {"data": {"enterprise": {"ownerInfo": {"samlIdentityProvider": {
+                        "externalIdentities": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [{"samlIdentity": {"nameId": guid}, "scimIdentity": {"username": guid}, "user": {"login": "real_dev"}}],
+                        }
+                    }}}}})
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(200, {"total_seats": 1, "seats": [{
+                    "assignee": {"login": guid, "id": 9, "type": "User"},
+                    "organization": {"login": "acme"},
+                    "created_at": "2026-03-01T00:00:00Z",
+                    "pending_cancellation_date": None,
+                    "plan_type": "enterprise",
+                }]}, headers={})
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": SuspendedSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    cli.run(cfg)
+    with open(cfg.output_path, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    r = rows[0]
+    assert r["user_login"] == "real_dev"           # GUID resolved to real login
+    assert r["external_identity"] == guid          # GUID surfaced separately
+    assert r["user_status"] == "inactive"          # suspended -> inactive
+    assert r["account_state"] == "suspended"
+
+
+def test_aic_consumption_populated_end_to_end(tmp_path, monkeypatch):
+    class AicSession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/settings/billing/ai_credit/usage" in url:
+                return FakeResponse(200, {"timePeriod": {"year": 2026, "month": 7},
+                                          "user": (params or {}).get("user"),
+                                          "usageItems": [{"netQuantity": 250, "netAmount": 2.5}]})
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": AicSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    log = cli.run(cfg)
+    assert log.aic_consumption_source == "api"
+    with open(cfg.output_path, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    r = rows[0]
+    assert r["aic_consumed"] == "250"
+    assert r["aic_consumed_usd"] == "2.50"
