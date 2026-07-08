@@ -235,6 +235,56 @@ def test_run_degraded_optional_scopes(tmp_path, monkeypatch):
     assert any("optional scope" in w for w in log.warnings)
 
 
+class StandaloneEnterpriseSession(RoutingSession):
+    """Simulates a token that cannot see the enterprise itself.
+
+    The enterprise-wide Copilot seats endpoint 404s and GraphQL enterprise org
+    discovery returns a null enterprise (partial "Not Found"), but the token can
+    read some organizations' Copilot billing directly via ``/user/orgs``. This is
+    the standalone-Copilot-enterprise / limited-PAT case: discovery must fall back
+    so seats are still reported instead of writing an empty CSV.
+    """
+
+    def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+        if url.endswith("/graphql"):
+            q = (json or {}).get("query", "")
+            if "organizations" in q or "ownerInfo" in q:
+                return FakeResponse(200, {
+                    "data": {"enterprise": None},
+                    "errors": [{"type": "NOT_FOUND", "path": ["enterprise"],
+                                "message": "Could not resolve to an Enterprise"}],
+                })
+            return FakeResponse(200, {"data": {}})
+        if "/enterprises/" in url and "/copilot/billing/seats" in url:
+            return FakeResponse(404, {"message": "Not Found"}, text="Not Found")
+        if url.endswith("/user/orgs"):
+            return FakeResponse(200, [{"login": "acme"}], headers={})
+        return super().request(method, url, params, json, timeout=timeout, headers=headers)
+
+
+def test_falls_back_to_user_orgs_when_enterprise_inaccessible(tmp_path, monkeypatch):
+    import copilot_aic_report.github_client as gc
+
+    def patched(self):
+        if self.session is None:
+            self.session = StandaloneEnterpriseSession()
+        self.sleep = lambda s: None
+
+    monkeypatch.setattr(gc.GitHubClient, "__post_init__", patched)
+    cfg = _make_cfg(tmp_path)
+    log = cli.run(cfg)
+
+    # The enterprise endpoints were inaccessible, but per-org discovery over the
+    # token's own orgs still produced seats -> a non-empty report.
+    assert log.rows_written == 1
+    assert log.seats_found == 1
+    with open(cfg.output_path, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows[0]["user_login"] == "mona_acme"
+    assert rows[0]["org_login"] == "acme"
+    assert any("per-org" in w or "org discovery" in w for w in log.warnings)
+
+
 def test_load_identity_map(tmp_path):
     p = tmp_path / "idmap.json"
     p.write_text(
