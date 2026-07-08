@@ -8,6 +8,7 @@ JSON sidecar. Secrets are never included.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -108,6 +109,8 @@ class RunLog:
         return "\n".join(lines) + "\n"
 
     def write(self, log_path: str) -> None:
+        parent = os.path.dirname(os.path.abspath(log_path))
+        os.makedirs(parent, exist_ok=True)
         with open(log_path, "w", encoding="utf-8") as fh:
             fh.write(self.render_text())
         json_path = log_path + ".json" if not log_path.endswith(".json") else log_path

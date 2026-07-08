@@ -56,3 +56,9 @@ def test_write_rollup(tmp_path):
     assert n == 1
     rows = _read(str(out))
     assert rows[0] == csv_writer.ROLLUP_COLUMNS
+
+
+def test_write_creates_missing_parent_dir(tmp_path):
+    out = tmp_path / "nested" / "sub" / "report.csv"
+    csv_writer.write_report(str(out), [{"user_login": "mona"}])
+    assert out.exists()

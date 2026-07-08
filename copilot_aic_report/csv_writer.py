@@ -7,6 +7,7 @@ are emitted rather than the literal string ``null``.
 from __future__ import annotations
 
 import csv
+import os
 from typing import Dict, Iterable, List
 
 from .util import cell
@@ -68,6 +69,8 @@ ROLLUP_COLUMNS: List[str] = [
 
 def write_rows(path: str, rows: Iterable[Dict[str, object]], columns: List[str] = ALL_COLUMNS) -> int:
     """Write ``rows`` (list of dicts) to ``path`` as UTF-8 CSV. Returns row count."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
     count = 0
     with open(path, "w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
