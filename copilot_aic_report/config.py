@@ -146,6 +146,8 @@ class Config:
     backoff_max_seconds: float = 60.0
     per_page: int = 100
     checkpoint_path: Optional[str] = None
+    # Concurrency for per-user AIC consumption fetches (one call per user).
+    aic_concurrency: int = 8
 
     # Secret (never serialized). Populated from env only.
     token: Optional[str] = field(default=None, repr=False)

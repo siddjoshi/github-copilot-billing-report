@@ -53,11 +53,31 @@ Common flags (all also settable in the config file):
 | `--snapshot-store` | Directory of durable monthly snapshots (written & read). |
 | `--audit-archive` | Streamed audit-log export (JSON/JSONL/dir) for history >180 days. |
 | `--identity-map` | Append-only identity fallback JSON. |
-| `--aic-csv` | Per-user AIC consumption CSV export (from the billing UI). |
+| `--aic-csv` | Per-user AIC consumption CSV export (from the billing UI) — fastest bulk source. |
+| `--fetch-membership` | Also fetch each org's member list (one call/org). Default: enterprise SCIM only. |
+| `--fetch-org-billing` | Also fetch per-org Copilot billing summary (one call/org) for reconciliation. Default off. |
+| `--fetch-org-identities` | Also fetch per-org SAML identities (one call/org). Default: enterprise externalIdentities. |
 | `--rollup` | Also write a per-user aggregated rollup CSV. |
 | `--allow-partial-scopes` | Warn (don't fail) when optional scopes are missing. |
 
 Copy `config.example.yaml` to get started.
+
+### Enterprise-first API usage
+
+By default the tool uses **enterprise-level** endpoints and avoids per-org calls:
+seats (`/enterprises/{ent}/copilot/billing/seats`, one paginated call with per-seat
+`organization` attribution), externalIdentities, SCIM, audit log, billing usage, and
+per-user AI-credit usage. Per-org membership/billing/identity calls are opt-in via the
+flags above. If the enterprise seats endpoint is unavailable, the tool falls back to
+discovering orgs and iterating them (skipping orgs that reject the token).
+
+### Per-user AI-credit consumption performance
+
+Per-user AIC consumption comes from
+`GET /enterprises/{ent}/settings/billing/ai_credit/usage?user={login}` — one call per
+user. For large enterprises this is fetched concurrently (`aic_concurrency`, default 8).
+For the fastest bulk load, export the premium-request/AI-credit report from the billing
+UI and pass it with `--aic-csv` (also required for accurate historical months).
 
 ---
 

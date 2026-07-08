@@ -53,7 +53,9 @@ def test_pending_cancellation():
     rows = led.materialize_month("2026-07", "now")
     r = rows[0]
     assert r.seat_status == "pending_cancellation"
-    assert r.user_status == "active"
+    # A scheduled cancellation is "cancelled" -> inactive, with the revoke date shown.
+    assert r.user_status == "inactive"
+    assert r.user_revoked_date == "2026-07-31"
 
 
 def test_audit_reconstructed_revoked():

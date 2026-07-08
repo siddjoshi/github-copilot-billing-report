@@ -253,13 +253,16 @@ class SeatLedger:
         if interval.revoked_at is not None and interval.revoked_at < cycle_end:
             revoked_date = interval.revoked_at.date().isoformat()
             if interval.pending_cancellation_at is not None and interval.revoked_at >= cycle_start:
+                # Cancellation scheduled: the license is cancelled (not "active") per the
+                # reporting definition, though the seat exists until end-of-cycle.
                 seat_status = "pending_cancellation"
-                user_status = "active"  # still holds seat until end-of-cycle
+                user_status = "inactive"
             else:
                 seat_status = "removed"
                 user_status = "inactive"
         elif interval.pending_cancellation_at is not None:
             seat_status = "pending_cancellation"
+            user_status = "inactive"
 
         if interval.origin == "live_seat":
             row_source = "live_seats"

@@ -7,6 +7,8 @@ usage-report API.
 from __future__ import annotations
 
 import csv
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -66,39 +68,55 @@ def fetch_from_api(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> list
             seen.add(str(login).lower())
             logins.append(login)
 
-    rows: list[AicConsumption] = []
-    any_success = False
-    for login in logins:
+    if not logins:
+        return []
+
+    rate = float(cfg.credit_to_usd)
+    unavailable = threading.Event()
+    auth_failure: list = []
+
+    def _fetch_one(login: str) -> Optional[AicConsumption]:
+        if unavailable.is_set() or auth_failure:
+            return None
         try:
             payload = client.get(endpoint, params={**params_base, "user": login})
         except AuthFailure as exc:
-            raise AicSourceUnavailable("AIC consumption API is not accessible") from exc
+            auth_failure.append(exc)
+            return None
         except GitHubError as exc:
             if exc.status in (403, 404, 410):
-                # Enterprise endpoint unavailable entirely -> stop and signal fallback.
-                raise AicSourceUnavailable("enterprise AIC usage endpoint unavailable") from exc
+                unavailable.set()
+                return None
             raise
-        any_success = True
         items = payload.get("usageItems") if isinstance(payload, dict) else None
         if not items:
-            continue
+            return None
         credits = sum(_to_float(item.get("netQuantity")) for item in items)
         usd = sum(_to_float(item.get("netAmount")) for item in items)
         if credits == 0 and usd == 0:
-            continue
-        rows.append(
-            AicConsumption(
-                user_login=str(login).strip(),
-                org_login=None,  # enterprise-wide per-user consumption
-                credits_consumed=credits,
-                usd_consumed=usd if usd else credits * float(cfg.credit_to_usd),
-                source="api",
-                raw={"user": login, "usage_items": len(items)},
-            )
+            return None
+        return AicConsumption(
+            user_login=str(login).strip(),
+            org_login=None,  # enterprise-wide per-user consumption
+            credits_consumed=credits,
+            usd_consumed=usd if usd else credits * rate,
+            source="api",
+            raw={"user": login, "usage_items": len(items)},
         )
 
-    if not any_success and logins:
-        raise AicSourceUnavailable("no AIC usage retrieved")
+    workers = max(1, int(getattr(cfg, "aic_concurrency", 1) or 1))
+    rows: list[AicConsumption] = []
+    if workers == 1:
+        results = [_fetch_one(login) for login in logins]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_fetch_one, logins))
+    rows = [r for r in results if r is not None]
+
+    if auth_failure:
+        raise AicSourceUnavailable("AIC consumption API is not accessible") from auth_failure[0]
+    if not rows and unavailable.is_set():
+        raise AicSourceUnavailable("enterprise AIC usage endpoint unavailable")
     return rows
 
 
