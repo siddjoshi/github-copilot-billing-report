@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "copilot-aic-report"
+version = "0.1.0"
+description = "Export GitHub Enterprise Copilot license + AI Credits (AIC) report to CSV (read-only)."
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "responses>=0.24",
+]
+
+[project.scripts]
+copilot-aic-report = "copilot_aic_report.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["copilot_aic_report*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["copilot_aic_report"]
+branch = true

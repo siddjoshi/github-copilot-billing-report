@@ -1,0 +1,52 @@
+# Example configuration for copilot-aic-report (YAML).
+# Copy to config.yaml and edit. Secrets are NEVER read from this file — set the
+# GitHub token via the GITHUB_TOKEN (or GH_TOKEN / COPILOT_AIC_TOKEN) env var.
+
+# ---- Enterprise / scope ----------------------------------------------------
+enterprise_slug: my-enterprise
+orgs: all                     # "all" (auto-discover) OR a list: [org-a, org-b]
+
+# ---- Reporting window ------------------------------------------------------
+billing_period: ""            # "YYYY-MM"; empty => current UTC month
+# report_months: last_6_months        # OR "2026-01..2026-07" OR [2026-01, 2026-02]
+# activity_window_days: 30            # optional; default uses the billing cycle
+
+# ---- Pricing (negotiated seat prices vary — set your actuals) ---------------
+license_cost_table:
+  business: 19.0
+  enterprise: 39.0
+
+# ---- AI Credit plan defaults (date-aware; GitHub adjusts these) ------------
+# Either a plain mapping (open-ended) or a list of dated windows (promo-aware).
+default_aic_table:
+  - start: "2026-01-01"       # example promo window
+    end: "2026-06-30"
+    credits: {business: 3000, enterprise: 7000}
+  - credits: {business: 1900, enterprise: 3900}   # steady-state default
+
+credit_to_usd: 0.01
+currency: USD
+
+# ---- Optional per-user "assigned" AIC budgets (USD) ------------------------
+# per_user_aic_budget_usd:
+#   mona_acme: 50.0
+
+# ---- Per-user AIC consumption source (adapter auto-detects both) -----------
+aic_consumption_api_enabled: true
+# aic_consumption_csv_path: ./exports/aic_usage_2026-07.csv
+
+# ---- Historical reporting / durability -------------------------------------
+snapshot_store: ./snapshots           # written every run; read for exact history
+# audit_archive: ./audit_stream       # streamed audit logs (JSON/JSONL/dir) for >180d
+identity_map_path: ./identity_map.json  # append-only fallback resolver (required for history)
+
+# ---- Output / logging ------------------------------------------------------
+output_path: ./copilot_aic_report.csv
+log_path: ./copilot_aic_report.log
+emit_rollup: true
+rollup_path: ./copilot_aic_rollup.csv
+# checkpoint_path: ./checkpoint.json
+
+# ---- Resilience ------------------------------------------------------------
+max_retries: 5
+per_page: 100

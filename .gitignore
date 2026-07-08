@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Tool outputs (never commit reports, logs, snapshots, or secrets)
+*.csv
+*.log
+*.log.json
+snapshots/
+checkpoint*.json
+config.yaml
+identity_map.json
+.env
