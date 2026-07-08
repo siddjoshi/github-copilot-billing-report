@@ -72,8 +72,8 @@ def test_load_from_csv_missing_file_raises_source_unavailable(tmp_path):
 
 def test_fetch_from_api_queries_enterprise_endpoint_and_sums_items():
     client = FakeClient({"usageItems": [
-        {"product": "copilot", "netQuantity": 5, "netAmount": 0.05},
-        {"product": "copilot", "netQuantity": 3, "netAmount": 0.03},
+        {"product": "copilot", "grossQuantity": 5, "grossAmount": 0.05},
+        {"product": "copilot", "grossQuantity": 3, "grossAmount": 0.03},
     ]})
     cfg = Config(enterprise_slug="my-ent", billing_period="2026-07", credit_to_usd=0.01)
 
@@ -92,7 +92,7 @@ def test_fetch_from_api_queries_enterprise_endpoint_and_sums_items():
 
 
 def test_fetch_from_api_dedupes_logins_across_orgs():
-    client = FakeClient({"usageItems": [{"netQuantity": 10, "netAmount": 0.1}]})
+    client = FakeClient({"usageItems": [{"grossQuantity": 10, "grossAmount": 0.1}]})
     cfg = Config(enterprise_slug="ent", billing_period="2026-07")
     # Same login in two orgs -> queried once (enterprise-wide).
     rows = fetch_from_api(client, cfg, [("org-a", "dana"), ("org-b", "dana")])
@@ -101,7 +101,7 @@ def test_fetch_from_api_dedupes_logins_across_orgs():
 
 
 def test_fetch_from_api_derives_usd_when_amount_absent():
-    client = FakeClient({"usageItems": [{"netQuantity": 100}]})
+    client = FakeClient({"usageItems": [{"grossQuantity": 100}]})
     cfg = Config(billing_period="2026-07", credit_to_usd=0.01)
     rows = fetch_from_api(client, cfg, [("org", "u")])
     assert rows[0].credits_consumed == 100.0
@@ -109,7 +109,7 @@ def test_fetch_from_api_derives_usd_when_amount_absent():
 
 
 def test_fetch_from_api_skips_users_with_zero_consumption():
-    client = FakeClient({"usageItems": [{"netQuantity": 0, "netAmount": 0}]})
+    client = FakeClient({"usageItems": [{"grossQuantity": 0, "grossAmount": 0}]})
     rows = fetch_from_api(client, Config(billing_period="2026-07"), [("org", "u")])
     assert rows == []
 
@@ -143,7 +143,7 @@ def test_get_consumption_prefers_csv_when_path_is_set_even_if_api_enabled(tmp_pa
     csv_path.write_text("user,credits\nerin,3\n", encoding="utf-8")
 
     rows, source = get_consumption(
-        FakeClient(payload={"usageItems": [{"netQuantity": 10}]}),
+        FakeClient(payload={"usageItems": [{"grossQuantity": 10}]}),
         Config(aic_consumption_csv_path=str(csv_path), aic_consumption_api_enabled=True),
         [("org", "api-user")],
     )
@@ -154,7 +154,7 @@ def test_get_consumption_prefers_csv_when_path_is_set_even_if_api_enabled(tmp_pa
 
 def test_get_consumption_uses_api_when_enabled_without_csv_path():
     rows, source = get_consumption(
-        FakeClient(payload={"usageItems": [{"netQuantity": 2, "netAmount": 0.02}]}),
+        FakeClient(payload={"usageItems": [{"grossQuantity": 2, "grossAmount": 0.02}]}),
         Config(billing_period="2026-07", aic_consumption_api_enabled=True, aic_consumption_csv_path=None),
         [("eng", "frank")],
     )
@@ -165,7 +165,7 @@ def test_get_consumption_uses_api_when_enabled_without_csv_path():
 
 def test_get_consumption_none_without_holders():
     rows, source = get_consumption(
-        FakeClient(payload={"usageItems": [{"netQuantity": 2}]}),
+        FakeClient(payload={"usageItems": [{"grossQuantity": 2}]}),
         Config(aic_consumption_api_enabled=True, aic_consumption_csv_path=None),
         [],
     )
@@ -190,7 +190,7 @@ def test_get_consumption_returns_none_when_api_unavailable_and_csv_missing(tmp_p
 
 def test_get_consumption_returns_none_when_no_sources_configured():
     rows, source = get_consumption(
-        FakeClient(payload={"usageItems": [{"netQuantity": 1}]}),
+        FakeClient(payload={"usageItems": [{"grossQuantity": 1}]}),
         Config(aic_consumption_api_enabled=False, aic_consumption_csv_path=None),
         [("org", "ignored")],
     )

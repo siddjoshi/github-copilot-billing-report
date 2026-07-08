@@ -472,7 +472,7 @@ def test_aic_consumption_populated_end_to_end(tmp_path, monkeypatch):
             if "/settings/billing/ai_credit/usage" in url:
                 return FakeResponse(200, {"timePeriod": {"year": 2026, "month": 7},
                                           "user": (params or {}).get("user"),
-                                          "usageItems": [{"netQuantity": 250, "netAmount": 2.5}]})
+                                          "usageItems": [{"grossQuantity": 250, "grossAmount": 2.5, "netQuantity": 0, "netAmount": 0}]})
             return super().request(method, url, params, json, headers, timeout)
 
     holder = {"session": AicSession()}

@@ -2,9 +2,9 @@ from copilot_aic_report import reconcile
 from copilot_aic_report.models import BillingUsageLine, OrgBillingSummary
 
 
-def _usage(net, product="copilot", sku="copilot_premium_requests"):
+def _usage(net, product="copilot", sku="copilot_premium_requests", date="2026-07-01"):
     return BillingUsageLine(
-        date="2026-07-01",
+        date=date,
         product=product,
         sku=sku,
         quantity=1,
@@ -83,6 +83,25 @@ def test_aic_reconciliation_zero_net():
     rows = [_row(aic_consumed_usd="0")]
     res = reconcile.check_aic_reconciliation(rows, [])
     assert res["ok"]
+
+
+def test_aic_reconciliation_scopes_usage_by_period():
+    # Per-user rows for June; billing lines for both June and July. The July net
+    # must NOT be counted when reconciling June.
+    rows = [_row(aic_consumed_usd="10.00", billing_period="2026-06")]
+    usage = [_usage(5.0, date="2026-06-01"), _usage(500.0, date="2026-07-01")]
+    res = reconcile.check_aic_reconciliation(rows, usage, period="2026-06")
+    assert res["ok"]  # only June net (5) compared against June gross (10)
+    assert "billing_net_usd=5.00" in res["detail"]
+
+
+def test_aic_reconciliation_period_filters_out_other_months():
+    # No June billing lines -> net 0 for June even though July has a large net.
+    rows = [_row(aic_consumed_usd="0", billing_period="2026-06")]
+    usage = [_usage(500.0, date="2026-07-01")]
+    res = reconcile.check_aic_reconciliation(rows, usage, period="2026-06")
+    assert res["ok"]
+    assert "billing_net_usd=0.00" in res["detail"]
 
 
 def test_summarize_history():

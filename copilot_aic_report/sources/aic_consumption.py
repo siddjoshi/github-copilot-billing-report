@@ -91,8 +91,12 @@ def fetch_from_api(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> list
         items = payload.get("usageItems") if isinstance(payload, dict) else None
         if not items:
             return None
-        credits = sum(_to_float(item.get("netQuantity")) for item in items)
-        usd = sum(_to_float(item.get("netAmount")) for item in items)
+        # "Consumed" = credits actually used (gross). netQuantity/netAmount is the
+        # BILLED amount after the included allowance discount and is often 0 even
+        # when the user consumed credits, so it must NOT be used for consumption.
+        credits = sum(_to_float(item.get("grossQuantity")) for item in items)
+        usd = sum(_to_float(item.get("grossAmount")) for item in items)
+        net_usd = sum(_to_float(item.get("netAmount")) for item in items)
         if credits == 0 and usd == 0:
             return None
         return AicConsumption(
@@ -101,7 +105,7 @@ def fetch_from_api(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> list
             credits_consumed=credits,
             usd_consumed=usd if usd else credits * rate,
             source="api",
-            raw={"user": login, "usage_items": len(items)},
+            raw={"user": login, "usage_items": len(items), "net_usd": net_usd},
         )
 
     workers = max(1, int(getattr(cfg, "aic_concurrency", 1) or 1))
