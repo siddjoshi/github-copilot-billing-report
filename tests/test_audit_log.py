@@ -46,7 +46,9 @@ def test_fetch_events_extracts_login_variants_and_org_values():
         )
     ]
     assert [event.user_login for event in events] == ["alice", "bob", "carol"]
-    assert [event.org_login for event in events] == ["octo", "biz", "org-from-raw"]
+    # ``business`` is the enterprise, not an org, so it no longer becomes org_login;
+    # such events fall back to the provided org (here "fallback-org").
+    assert [event.org_login for event in events] == ["octo", "fallback-org", "org-from-raw"]
     assert [event.timestamp_ms for event in events] == [10, 20, 30]
     assert all(event.raw is raw for event, raw in zip(events, raw_events))
 
@@ -63,11 +65,15 @@ def test_fetch_events_extracts_user_id():
     assert [event.user_id for event in events] == [42, 77, None]
 
 
-def test_fetch_enterprise_and_org_events_request_assigned_and_cancelled():
+def test_fetch_enterprise_and_org_events_use_umbrella_query_and_filter_seat_actions():
     client = FakeClient(
         [
-            {"action": "copilot.seat_assigned", "@timestamp": 1, "user": "alice"},
-            {"action": "copilot.seat_cancelled", "@timestamp": 2, "user": "bob"},
+            {"action": "copilot.cfb_seat_added", "@timestamp": 1, "user": "alice"},
+            {"action": "copilot.cfb_seat_cancelled", "@timestamp": 2, "user": "bob"},
+            {"action": "copilot.cfb_seat_assignment_unassigned", "@timestamp": 3, "user": "carol"},
+            {"action": "copilot.access_revoked", "@timestamp": 4, "user": "dave"},
+            {"action": "copilot.cfb_enterprise_settings_changed", "@timestamp": 5, "user": "eve"},
+            {"action": "user.login", "@timestamp": 6, "user": "frank"},
         ]
     )
     cfg = Config(enterprise_slug="my-ent")
@@ -75,18 +81,20 @@ def test_fetch_enterprise_and_org_events_request_assigned_and_cancelled():
     enterprise_events = audit_log.fetch_enterprise_events(client, cfg)
     org_events = audit_log.fetch_org_events(client, cfg, "my-org")
 
+    # Only Copilot seat lifecycle actions are kept (settings_changed / user.login dropped).
     assert [event.action for event in enterprise_events] == [
-        "copilot.seat_assigned",
-        "copilot.seat_cancelled",
-        "copilot.seat_assigned",
-        "copilot.seat_cancelled",
+        "copilot.cfb_seat_added",
+        "copilot.cfb_seat_cancelled",
+        "copilot.cfb_seat_assignment_unassigned",
+        "copilot.access_revoked",
     ]
+    # Enterprise-direct events (no org) are attributed to enterprise:{slug}.
+    assert enterprise_events[0].org_login == "enterprise:my-ent"
     assert [event.org_login for event in org_events] == ["my-org"] * 4
+    # A single umbrella "action:copilot" query per scope (not one per action name).
     assert client.calls == [
-        ("/enterprises/my-ent/audit-log", {"phrase": "action:copilot.seat_assigned"}, None),
-        ("/enterprises/my-ent/audit-log", {"phrase": "action:copilot.seat_cancelled"}, None),
-        ("/orgs/my-org/audit-log", {"phrase": "action:copilot.seat_assigned"}, None),
-        ("/orgs/my-org/audit-log", {"phrase": "action:copilot.seat_cancelled"}, None),
+        ("/enterprises/my-ent/audit-log", {"phrase": "action:copilot"}, None),
+        ("/orgs/my-org/audit-log", {"phrase": "action:copilot"}, None),
     ]
 
 

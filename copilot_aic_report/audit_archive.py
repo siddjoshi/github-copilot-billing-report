@@ -14,12 +14,11 @@ import os
 from typing import Any, Dict, Iterator, List, Optional
 
 from .models import AuditEvent
+from .sources.audit_log import SEAT_ACTIONS as _SEAT_ACTIONS_TUPLE
 
-SEAT_ACTIONS = {
-    "copilot.seat_assigned",
-    "copilot.seat_cancelled",
-    "copilot.seat_refresh",
-}
+# Copilot seat lifecycle actions (both modern ``cfb_`` and legacy names), reused from
+# the audit-log source so archive and API ingestion stay in lockstep.
+SEAT_ACTIONS = set(_SEAT_ACTIONS_TUPLE)
 
 
 def _iter_records_from_text(text: str) -> Iterator[Dict[str, Any]]:
