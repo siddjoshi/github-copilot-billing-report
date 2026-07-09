@@ -60,35 +60,62 @@ def fetch_from_api(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> list
     params_base = {"year": int(year_text), "month": int(month_text)}
     endpoint = f"/enterprises/{cfg.enterprise_slug}/settings/billing/ai_credit/usage"
 
-    # Unique logins across the (org, login) holders.
-    logins: list[str] = []
+    # Unique holders keyed by login. Each holder may carry a numeric user id used as
+    # a best-effort fallback query key for deprovisioned users whose login handle no
+    # longer resolves against the usage API.
+    unique: list[tuple] = []
     seen: set = set()
-    for _org, login in holders:
-        if login and str(login).lower() not in seen:
-            seen.add(str(login).lower())
-            logins.append(login)
+    for holder in holders:
+        org = holder[0] if len(holder) > 0 else None
+        login = holder[1] if len(holder) > 1 else None
+        user_id = holder[2] if len(holder) > 2 else None
+        if not login:
+            continue
+        key = str(login).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((login, user_id))
 
-    if not logins:
+    if not unique:
         return []
 
     rate = float(cfg.credit_to_usd)
     unavailable = threading.Event()
     auth_failure: list = []
 
-    def _fetch_one(login: str) -> Optional[AicConsumption]:
-        if unavailable.is_set() or auth_failure:
-            return None
+    def _query(user_key: str, *, is_fallback: bool) -> Optional[list]:
+        """Return usageItems for one user key, or None if nothing/unavailable.
+
+        A primary (login) query treats a hard 403/404/410 as "endpoint
+        unavailable" (so callers fall back to CSV). A fallback (user-id) query
+        swallows those errors locally without aborting the whole run.
+        """
         try:
-            payload = client.get(endpoint, params={**params_base, "user": login})
+            payload = client.get(endpoint, params={**params_base, "user": user_key})
         except AuthFailure as exc:
+            if is_fallback:
+                return None
             auth_failure.append(exc)
             return None
         except GitHubError as exc:
             if exc.status in (403, 404, 410):
-                unavailable.set()
+                if not is_fallback:
+                    unavailable.set()
                 return None
             raise
         items = payload.get("usageItems") if isinstance(payload, dict) else None
+        return items or None
+
+    def _fetch_one(entry: tuple) -> Optional[AicConsumption]:
+        login, user_id = entry
+        if unavailable.is_set() or auth_failure:
+            return None
+        items = _query(login, is_fallback=False)
+        # Deprovisioned users: the obfuscated login often yields nothing; retry by
+        # the permanent numeric user id (best-effort).
+        if not items and user_id is not None and not unavailable.is_set() and not auth_failure:
+            items = _query(str(user_id), is_fallback=True)
         if not items:
             return None
         # "Consumed" = credits actually used (gross). netQuantity/netAmount is the
@@ -111,10 +138,10 @@ def fetch_from_api(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> list
     workers = max(1, int(getattr(cfg, "aic_concurrency", 1) or 1))
     rows: list[AicConsumption] = []
     if workers == 1:
-        results = [_fetch_one(login) for login in logins]
+        results = [_fetch_one(entry) for entry in unique]
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(_fetch_one, logins))
+            results = list(pool.map(_fetch_one, unique))
     rows = [r for r in results if r is not None]
 
     if auth_failure:

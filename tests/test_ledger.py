@@ -9,11 +9,11 @@ def _ms(y, m, d):
     return int(dt.datetime(y, m, d, tzinfo=dt.timezone.utc).timestamp() * 1000)
 
 
-def _seat(login, org, created, pending=None, plan="business", team=None):
+def _seat(login, org, created, pending=None, plan="business", team=None, uid=1):
     return Seat(
         org_login=org,
         assignee_login=login,
-        assignee_id=1,
+        assignee_id=uid,
         assignee_type="User",
         created_at=created,
         pending_cancellation_date=pending,
@@ -95,6 +95,18 @@ def test_cancel_without_assign_predates_history():
     assert any("predates" in n for n in feb[0].notes)
 
 
+def test_pending_cancellation_future_cycle_still_sets_revoked_date():
+    # A pending cancellation scheduled beyond the current cycle end must still show
+    # the user as inactive WITH the scheduled revoke date (previously left empty).
+    led = SeatLedger()
+    led.add_live_seat(_seat("mona", "acme", "2026-03-01T00:00:00Z", pending="2026-09-30T00:00:00Z"))
+    rows = led.materialize_month("2026-07", "now")
+    r = rows[0]
+    assert r.seat_status == "pending_cancellation"
+    assert r.user_status == "inactive"
+    assert r.user_revoked_date == "2026-09-30"
+
+
 def test_snapshot_month_is_authoritative():
     led = SeatLedger()
     led.add_snapshot("2026-02", [{"user_login": "snapuser", "org_login": "acme", "user_status": "active", "seat_status": "active"}])
@@ -161,7 +173,7 @@ def test_live_seat_holders_uses_real_login():
     led = SeatLedger(resolver=resolver)
     led.add_live_seat(_seat(_GUID, "acme", "2026-03-01T00:00:00Z"))
     led.add_live_seat(_seat("octo", "globex", "2026-03-01T00:00:00Z"))
-    holders = set(led.live_seat_holders())
+    holders = {(org, login) for org, login, _uid in led.live_seat_holders()}
     assert ("acme", "mona_acme") in holders
     assert ("globex", "octo") in holders
 
@@ -175,3 +187,40 @@ def test_enterprise_direct_seat_without_org_is_not_dropped():
     assert len(rows) == 1
     assert rows[0].user_login == "Hemant_HondaCN"
     assert rows[0].user_status == "active"
+
+
+def test_seat_github_user_id_threaded_to_row():
+    led = SeatLedger()
+    led.add_live_seat(_seat("mona_acme", "acme", "2026-03-01T00:00:00Z", uid=98765))
+    rows = led.materialize_month("2026-07", "now")
+    assert rows[0].github_user_id == 98765
+
+
+def test_obfuscated_login_kept_as_is_with_user_id():
+    # A deprovisioned EMU seat carries an obfuscated hex login; it is preserved as-is
+    # in user_login (not blanked) and the real numeric id is captured.
+    led = SeatLedger()
+    led.add_live_seat(_seat("4eb6538565c3d97ad2917d606ccdc4_LTIMPG", "acme", "2026-03-01T00:00:00Z", uid=555))
+    rows = led.materialize_month("2026-07", "now")
+    r = rows[0]
+    assert r.user_login == "4eb6538565c3d97ad2917d606ccdc4_LTIMPG"
+    assert r.github_user_id == 555
+    # Still queryable for AIC (login is truthy) with the id available.
+    assert ("acme", "4eb6538565c3d97ad2917d606ccdc4_LTIMPG", 555) in led.live_seat_holders()
+
+
+def test_user_id_login_index_recovers_real_login_by_id():
+    # One org has the user's real login (active); another surfaces the obfuscated
+    # handle (deprovisioned) with the SAME numeric id. The index maps id -> real login.
+    led = SeatLedger()
+    led.add_live_seat(_seat("mona_acme", "acme", "2026-03-01T00:00:00Z", uid=777))
+    led.add_live_seat(_seat("cafebabecafebabecafebabecafeba_acme", "globex", "2026-03-01T00:00:00Z", uid=777))
+    index = led.user_id_login_index()
+    assert index == {777: "mona_acme"}
+
+
+def test_user_id_login_index_from_audit_history():
+    led = SeatLedger()
+    led.add_audit_event(AuditEvent("copilot.seat_assigned", "octocat", "acme", _ms(2026, 1, 1), user_id=321))
+    index = led.user_id_login_index()
+    assert index[321] == "octocat"

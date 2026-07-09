@@ -11,8 +11,9 @@ from copilot_aic_report.sources.aic_consumption import (
 
 
 class FakeClient:
-    def __init__(self, payload=None, exc=None):
+    def __init__(self, payload=None, exc=None, payload_by_user=None):
         self.payload = payload
+        self.payload_by_user = payload_by_user
         self.exc = exc
         self.calls = []
 
@@ -20,6 +21,9 @@ class FakeClient:
         self.calls.append((path, params))
         if self.exc:
             raise self.exc
+        if self.payload_by_user is not None:
+            user = (params or {}).get("user")
+            return self.payload_by_user.get(user, {"usageItems": []})
         return self.payload
 
 
@@ -136,6 +140,56 @@ def test_fetch_from_api_enterprise_endpoint_404_raises_unavailable():
 
 def test_fetch_from_api_no_holders_returns_empty():
     assert fetch_from_api(FakeClient({"usageItems": []}), Config(billing_period="2026-07"), []) == []
+
+
+def test_fetch_from_api_falls_back_to_user_id_for_deprovisioned():
+    # The obfuscated login returns nothing; the numeric user id fallback finds usage.
+    client = FakeClient(payload_by_user={
+        "hash_LTIMPG": {"usageItems": []},
+        "555": {"usageItems": [{"grossQuantity": 42, "grossAmount": 0.42}]},
+    })
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07", credit_to_usd=0.01)
+    rows = fetch_from_api(client, cfg, [("acme", "hash_LTIMPG", 555)])
+    assert len(rows) == 1
+    # Attributed to the (obfuscated) login so it matches the report row's user_login.
+    assert rows[0].user_login == "hash_LTIMPG"
+    assert rows[0].credits_consumed == 42.0
+    # Both the login and the id-fallback queries were issued.
+    issued = [params.get("user") for _p, params in client.calls]
+    assert issued == ["hash_LTIMPG", "555"]
+
+
+def test_fetch_from_api_id_fallback_404_does_not_abort_run():
+    # A 404 on the id fallback must NOT mark the whole endpoint unavailable; other
+    # users still resolve normally.
+    class SelectiveClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None):
+            self.calls.append((path, params))
+            user = (params or {}).get("user")
+            if user == "999":  # id fallback 404s
+                raise GitHubError("missing", status=404)
+            if user == "ghost_LTIMPG":
+                return {"usageItems": []}
+            if user == "alice":
+                return {"usageItems": [{"grossQuantity": 10, "grossAmount": 0.1}]}
+            return {"usageItems": []}
+
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07", credit_to_usd=0.01)
+    rows = fetch_from_api(
+        SelectiveClient(), cfg,
+        [("acme", "ghost_LTIMPG", 999), ("acme", "alice", 1)],
+    )
+    assert [r.user_login for r in rows] == ["alice"]
+
+
+def test_fetch_from_api_still_accepts_two_tuple_holders():
+    client = FakeClient({"usageItems": [{"grossQuantity": 5, "grossAmount": 0.05}]})
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07", credit_to_usd=0.01)
+    rows = fetch_from_api(client, cfg, [("acme", "dana")])
+    assert rows[0].user_login == "dana"
 
 
 def test_get_consumption_prefers_csv_when_path_is_set_even_if_api_enabled(tmp_path):

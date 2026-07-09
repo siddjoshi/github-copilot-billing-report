@@ -4,6 +4,7 @@ from copilot_aic_report.resolve import (
     Resolution,
     canonicalize_login,
     emu_shortname,
+    is_obfuscated_login,
     is_placeholder_login,
     looks_like_external_id,
 )
@@ -105,3 +106,20 @@ def test_resolve_guid_via_external_index():
     res = r.resolve(external_id="2f1c8e4a-1234-4abc-9def-0123456789ab")
     assert res.user_login == "mona_acme"
     assert res.source == "externalIdentities"
+
+
+def test_is_obfuscated_login_detects_hex_and_guid():
+    # Obfuscated deprovisioned EMU handle: long hex + shortcode suffix.
+    assert is_obfuscated_login("4eb6538565c3d97ad2917d606ccdc4_LTIMPG")
+    assert is_obfuscated_login("1fa92af3ac5131c93a570316ba3d04_LTIMPG")
+    # Bare long hex, no suffix.
+    assert is_obfuscated_login("4eb6538565c3d97ad2917d606ccdc4")
+    # GUID form is also obfuscated.
+    assert is_obfuscated_login("2f1c8e4a-1234-4abc-9def-0123456789ab_acme")
+    # Real EMU / plain logins are NOT obfuscated.
+    assert not is_obfuscated_login("Hemant-10832601_HondaCN")
+    assert not is_obfuscated_login("mona_acme")
+    assert not is_obfuscated_login("octocat")
+    assert not is_obfuscated_login("dead_beef")  # short hex-ish shortname, real login
+    assert not is_obfuscated_login(None)
+    assert not is_obfuscated_login("")

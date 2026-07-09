@@ -30,6 +30,8 @@ RECOMMENDED_COLUMNS: List[str] = [
     "assigned_via",
     "last_activity_at",
     "external_identity",
+    "github_user_id",
+    "resolved_user_login",
     "identity_resolution_source",
     "account_state",
     "aic_assigned_rule_used",
@@ -50,6 +52,8 @@ ALL_COLUMNS: List[str] = REQUIRED_COLUMNS + RECOMMENDED_COLUMNS
 # Rollup (per-user aggregation) columns.
 ROLLUP_COLUMNS: List[str] = [
     "user_login",
+    "github_user_id",
+    "resolved_user_login",
     "earliest_license_assigned_date",
     "any_active",
     "user_status",

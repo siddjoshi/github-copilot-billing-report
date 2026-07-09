@@ -58,6 +58,22 @@ def test_write_rollup(tmp_path):
     assert rows[0] == csv_writer.ROLLUP_COLUMNS
 
 
+def test_new_identity_columns_present(tmp_path):
+    assert "github_user_id" in csv_writer.ALL_COLUMNS
+    assert "resolved_user_login" in csv_writer.ALL_COLUMNS
+    assert "github_user_id" in csv_writer.ROLLUP_COLUMNS
+    assert "resolved_user_login" in csv_writer.ROLLUP_COLUMNS
+    out = tmp_path / "r.csv"
+    csv_writer.write_report(
+        str(out),
+        [{"user_login": "hash_LTIMPG", "github_user_id": 555, "resolved_user_login": "mona_acme"}],
+    )
+    rows = _read(str(out))
+    idx = {c: i for i, c in enumerate(rows[0])}
+    assert rows[1][idx["github_user_id"]] == "555"
+    assert rows[1][idx["resolved_user_login"]] == "mona_acme"
+
+
 def test_write_creates_missing_parent_dir(tmp_path):
     out = tmp_path / "nested" / "sub" / "report.csv"
     csv_writer.write_report(str(out), [{"user_login": "mona"}])

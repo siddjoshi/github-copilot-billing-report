@@ -51,6 +51,18 @@ def test_fetch_events_extracts_login_variants_and_org_values():
     assert all(event.raw is raw for event, raw in zip(events, raw_events))
 
 
+def test_fetch_events_extracts_user_id():
+    raw_events = [
+        {"action": "copilot.seat_assigned", "@timestamp": 10, "user": "alice", "user_id": 42},
+        {"action": "copilot.seat_assigned", "@timestamp": 20, "user": "bob", "actor_id": "77"},
+        {"action": "copilot.seat_assigned", "@timestamp": 30, "user": "carol"},
+    ]
+    events = audit_log.fetch_events(
+        FakeClient(raw_events), Config(enterprise_slug="ent"), "copilot.seat_assigned"
+    )
+    assert [event.user_id for event in events] == [42, 77, None]
+
+
 def test_fetch_enterprise_and_org_events_request_assigned_and_cancelled():
     client = FakeClient(
         [

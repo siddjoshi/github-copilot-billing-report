@@ -213,10 +213,31 @@ class GitHubClient:
             self.stats.rest_calls += 1
             response = self._request("GET", url, params=query)
             payload = _safe_json(response)
-            for item in _extract_items(payload, items_key):
+            items = list(_extract_items(payload, items_key))
+            for item in items:
                 yield item
-            url = _next_link(getattr(response, "headers", {}) or {})
-            query = None  # subsequent URLs already carry the cursor
+            next_link = _next_link(getattr(response, "headers", {}) or {})
+            if next_link:
+                url = next_link
+                query = None  # subsequent URLs already carry the cursor
+                continue
+            # SCIM v2 pagination: no Link header, uses startIndex/count/totalResults.
+            if isinstance(payload, dict) and "totalResults" in payload:
+                try:
+                    total = int(payload.get("totalResults") or 0)
+                    start = int(payload.get("startIndex") or 1)
+                except (TypeError, ValueError):
+                    break
+                per = payload.get("itemsPerPage") or len(items) or self.per_page
+                try:
+                    per = int(per)
+                except (TypeError, ValueError):
+                    per = self.per_page
+                fetched = start - 1 + len(items)
+                if items and fetched < total:
+                    query = {"startIndex": fetched + 1, "count": per or self.per_page}
+                    continue  # re-request the same base URL with the next window
+            break
 
     # ---- GraphQL ---------------------------------------------------------
 

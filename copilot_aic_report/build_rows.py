@@ -11,7 +11,8 @@ from typing import Dict, List, Optional, Tuple
 from .config import Config, normalize_plan
 from .ledger import MaterializedSeat
 from .models import AccountState, AicConsumption
-from .util import fmt_money, fmt_num, now_utc_iso
+from .resolve import is_obfuscated_login
+from .util import fmt_money, fmt_num, now_utc_iso, to_utc_date
 
 # login_recovery_source -> identity_resolution_source (base column) mapping.
 _RESOLUTION_MAP = {
@@ -58,12 +59,16 @@ def build_rows(
     account_states: Optional[Dict[Tuple[str, str], AccountState]] = None,
     org_plan_by_org: Optional[Dict[str, str]] = None,
     per_user_has_consumption: bool = True,
+    user_id_to_login: Optional[Dict[int, str]] = None,
+    deprovisioned_at_by_login: Optional[Dict[str, str]] = None,
     generated_at: Optional[str] = None,
 ) -> List[Dict[str, object]]:
     """Build final CSV row dicts from materialized seats and side data."""
     consumption_index = consumption_index or {}
     account_states = account_states or {}
     org_plan_by_org = org_plan_by_org or {}
+    user_id_to_login = user_id_to_login or {}
+    deprovisioned_at_by_login = deprovisioned_at_by_login or {}
     generated_at = generated_at or now_utc_iso()
     rate = cfg.credit_to_usd
 
@@ -152,6 +157,39 @@ def build_rows(
         if seat.login_recovery_source == "UNRECOVERABLE":
             notes.append("UNRECOVERABLE login; external identity in external_identity only")
 
+        # Real GitHub user id (permanent) and best-effort recovery of the real login
+        # for deprovisioned users whose seat carries only an obfuscated handle.
+        github_user_id = seat.github_user_id
+        resolved_user_login = ""
+        if github_user_id is not None:
+            recovered = user_id_to_login.get(github_user_id)
+            if recovered:
+                resolved_user_login = recovered
+        if not resolved_user_login and login and not is_obfuscated_login(login):
+            # A normal, real login is itself the resolved login.
+            resolved_user_login = login
+        if login and is_obfuscated_login(login):
+            note = "obfuscated login (deprovisioned EMU); use github_user_id"
+            if not resolved_user_login:
+                note += " (real login unrecoverable)"
+            notes.append(note)
+
+        # Ensure revoked/inactive users carry a revocation date. Prefer any date
+        # already derived from the seat/audit history (e.g. pending cancellation);
+        # otherwise fall back to the SCIM deprovisioning timestamp, keyed by the real
+        # login or the login recovered from the numeric id.
+        revoked_date = seat.user_revoked_date or ""
+        if user_status == "inactive" and not revoked_date:
+            for key in (login, resolved_user_login):
+                if not key:
+                    continue
+                dep = deprovisioned_at_by_login.get(str(key).lower())
+                if dep:
+                    revoked_date = to_utc_date(dep)
+                    if revoked_date and "revoked date derived from SCIM deprovisioning" not in notes:
+                        notes.append("revoked date derived from SCIM deprovisioning")
+                    break
+
         row = {
             # Required (order enforced by csv_writer)
             "user_login": login or "",
@@ -161,7 +199,7 @@ def build_rows(
             "aic_billing_dollar_assigned": fmt_money(aic_assigned_usd),
             "aic_consumed": fmt_num(aic_consumed_credits),
             "user_status": user_status,
-            "user_revoked_date": seat.user_revoked_date,
+            "user_revoked_date": revoked_date,
             # Recommended / provenance
             "org_login": org,
             "plan_type": plan,
@@ -169,6 +207,8 @@ def build_rows(
             "assigned_via": seat.assigned_via or "",
             "last_activity_at": seat.last_activity_at or "",
             "external_identity": seat.external_identity or "",
+            "github_user_id": github_user_id if github_user_id is not None else "",
+            "resolved_user_login": resolved_user_login,
             "identity_resolution_source": identity_resolution_source,
             "account_state": account_state,
             "aic_assigned_rule_used": rule,
@@ -215,6 +255,8 @@ def build_rollup(rows: List[Dict[str, object]], cfg: Config, generated_at: Optio
             login,
             {
                 "user_login": row.get("user_login") or "",
+                "github_user_id": row.get("github_user_id") or "",
+                "resolved_user_login": row.get("resolved_user_login") or "",
                 "earliest_license_assigned_date": "",
                 "any_active": "no",
                 "orgs": set(),
@@ -231,6 +273,10 @@ def build_rollup(rows: List[Dict[str, object]], cfg: Config, generated_at: Optio
             },
         )
         agg["orgs"].add(str(row.get("org_login") or ""))
+        if not agg.get("github_user_id") and row.get("github_user_id"):
+            agg["github_user_id"] = row.get("github_user_id")
+        if not agg.get("resolved_user_login") and row.get("resolved_user_login"):
+            agg["resolved_user_login"] = row.get("resolved_user_login")
         assigned = str(row.get("license_assigned_date") or "")
         if assigned and (not agg["earliest_license_assigned_date"] or assigned < agg["earliest_license_assigned_date"]):
             agg["earliest_license_assigned_date"] = assigned
@@ -256,6 +302,8 @@ def build_rollup(rows: List[Dict[str, object]], cfg: Config, generated_at: Optio
         out.append(
             {
                 "user_login": agg["user_login"],
+                "github_user_id": agg.get("github_user_id", ""),
+                "resolved_user_login": agg.get("resolved_user_login", ""),
                 "earliest_license_assigned_date": agg["earliest_license_assigned_date"],
                 "any_active": agg["any_active"],
                 "user_status": "active" if agg["any_active"] == "yes" else "inactive",
