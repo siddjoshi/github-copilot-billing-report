@@ -630,3 +630,49 @@ def test_aic_consumption_populated_end_to_end(tmp_path, monkeypatch):
     r = rows[0]
     assert r["aic_consumed"] == "250"
     assert r["aic_consumed_usd"] == "2.50"
+
+
+def test_aic_csv_switch_populates_consumption_end_to_end(tmp_path, monkeypatch):
+    """The --aic-csv switch must feed per-user consumption through the full pipeline.
+
+    The CSV is authoritative and takes precedence over the per-user API (which the
+    default harness returns empty), so the seat holder's row must carry the CSV
+    credits/USD and the run log must record source='csv'.
+    """
+    _patch_session(monkeypatch)
+    csv_path = tmp_path / "aic.csv"
+    csv_path.write_text("user,credits,usd\nmona_acme,777,7.77\n", encoding="utf-8")
+    cfg = _make_cfg(tmp_path)
+    cfg.aic_consumption_csv_path = str(csv_path)
+
+    log = cli.run(cfg)
+
+    assert log.aic_consumption_source == "csv"
+    with open(cfg.output_path, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    r = rows[0]
+    assert r["user_login"] == "mona_acme"
+    assert r["aic_consumed"] == "777"
+    assert r["aic_consumed_usd"] == "7.77"
+
+
+def test_aic_csv_switch_zeroes_users_absent_from_csv(tmp_path, monkeypatch):
+    """With --aic-csv configured, a seat holder missing from the CSV is treated as
+    genuinely zero consumption (not 'unavailable'), because the CSV is authoritative."""
+    _patch_session(monkeypatch)
+    csv_path = tmp_path / "aic.csv"
+    # Consumption only for an unrelated user; mona_acme is absent from the export.
+    csv_path.write_text("user,credits,usd\nsomeone_else,10,0.10\n", encoding="utf-8")
+    cfg = _make_cfg(tmp_path)
+    cfg.aic_consumption_csv_path = str(csv_path)
+
+    log = cli.run(cfg)
+
+    assert log.aic_consumption_source == "csv"
+    with open(cfg.output_path, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    r = rows[0]
+    assert r["user_login"] == "mona_acme"
+    assert r["aic_consumed"] == "0"
+    assert r["aic_consumed_usd"] == "0.00"
+    assert "per-user AIC consumption unavailable for this month" not in (r.get("notes") or "")
