@@ -22,8 +22,21 @@ from .periods import cycle_bounds_utc, interval_overlaps_period
 from .resolve import IdentityResolver, canonicalize_login, extract_guid, is_obfuscated_login, is_placeholder_login
 from .util import epoch_ms_to_utc_datetime, to_utc_datetime
 
-ASSIGN_SUFFIXES = ("seat_assigned", "seat_refresh")
-CANCEL_SUFFIX = "seat_cancelled"
+# Suffixes cover both modern ``cfb_`` and legacy Copilot seat action names, e.g.
+# copilot.cfb_seat_added / copilot.seat_assigned (assign) and
+# copilot.cfb_seat_cancelled / copilot.cfb_seat_assignment_unassigned /
+# copilot.access_revoked / copilot.seat_cancelled (cancel).
+ASSIGN_SUFFIXES = (
+    "seat_added",
+    "seat_assignment_created",
+    "seat_assigned",
+    "seat_refresh",
+)
+CANCEL_SUFFIXES = (
+    "seat_cancelled",
+    "seat_assignment_unassigned",
+    "access_revoked",
+)
 
 
 @dataclass
@@ -78,38 +91,90 @@ class _Holder:
 class SeatLedger:
     def __init__(self, resolver: Optional[IdentityResolver] = None):
         self.resolver = resolver or IdentityResolver()
-        self._holders: Dict[Tuple[str, str], _Holder] = {}
+        # Alias map: multiple identifier keys may point to the SAME _Holder, so all
+        # events for one physical user (real login, obfuscated login, numeric id)
+        # merge into a single holder. Deduplicate via _unique_holders() when iterating.
+        self._holders: Dict[Tuple, _Holder] = {}
+        self._uid_index: Dict[Tuple[int, str], _Holder] = {}
+        self._anon_seq: int = 0
         # snapshot records keyed by period -> list of records
         self.snapshots: Dict[str, List[dict]] = {}
 
     # -- key helpers ------------------------------------------------------
 
-    def _key(self, login: Optional[str], org: str, external_id: Optional[str]) -> Tuple[str, str]:
-        ident = (canonicalize_login(login) or ("ext:" + (external_id or "unknown"))).lower()
-        return (ident, org)
+    @staticmethod
+    def _login_key(login: str, org: str) -> Tuple[str, str, str]:
+        return ("login", login.strip().lower(), org)
+
+    @staticmethod
+    def _ext_key(external_id: str, org: str) -> Tuple[str, str, str]:
+        return ("ext", str(external_id).strip().lower(), org)
+
+    def _unique_holders(self) -> List[_Holder]:
+        """Distinct holders (the alias map may reference one holder under several keys)."""
+        seen: Dict[int, _Holder] = {}
+        for holder in self._holders.values():
+            seen.setdefault(id(holder), holder)
+        for holder in self._uid_index.values():
+            seen.setdefault(id(holder), holder)
+        return list(seen.values())
 
     def _holder(self, login: Optional[str], org: str, external_id: Optional[str], source: str, user_id: Optional[int] = None) -> _Holder:
-        key = self._key(login, org, external_id)
-        holder = self._holders.get(key)
+        cl = canonicalize_login(login)
+        real_login = cl if (cl and not is_obfuscated_login(cl)) else None
+
+        # Locate an existing holder by (in priority order) numeric id, real login,
+        # external id, or obfuscated login — so split identities coalesce.
+        holder: Optional[_Holder] = None
+        if user_id is not None:
+            holder = self._uid_index.get((user_id, org))
+        if holder is None and real_login is not None:
+            holder = self._holders.get(self._login_key(real_login, org))
+        if holder is None and external_id:
+            holder = self._holders.get(self._ext_key(external_id, org))
+        if holder is None and cl and real_login is None:
+            holder = self._holders.get(self._login_key(cl, org))
+
         if holder is None:
-            resolved_login = canonicalize_login(login)
             holder = _Holder(
-                login=resolved_login,
+                login=cl,
                 org=org,
                 external_identity=external_id,
-                login_source=source if resolved_login else "UNRECOVERABLE",
+                login_source=source if cl else "UNRECOVERABLE",
                 user_id=user_id,
             )
-            self._holders[key] = holder
         else:
-            # Upgrade login if we now have a real one and previously did not.
-            if not holder.login and login:
-                holder.login = canonicalize_login(login)
+            if not holder.login and cl:
+                holder.login = cl
+                holder.login_source = source
+            elif holder.login and is_obfuscated_login(holder.login) and real_login:
+                # Upgrade an obfuscated placeholder login to the recovered real one.
+                holder.login = real_login
                 holder.login_source = source
             if not holder.external_identity and external_id:
                 holder.external_identity = external_id
             if holder.user_id is None and user_id is not None:
                 holder.user_id = user_id
+
+        # Register the holder under every identifier alias we now know.
+        registered = False
+        if user_id is not None:
+            self._uid_index[(user_id, org)] = holder
+            registered = True
+        if holder.login:
+            self._holders[self._login_key(holder.login, org)] = holder
+            registered = True
+        if cl:
+            self._holders[self._login_key(cl, org)] = holder
+            registered = True
+        if external_id:
+            self._holders[self._ext_key(external_id, org)] = holder
+            registered = True
+        if not registered:
+            # No usable identifier at all (e.g. a seat with no assignee); keep the
+            # holder under a unique synthetic key so it still materializes a row.
+            self._anon_seq += 1
+            self._holders[("anon", self._anon_seq, org)] = holder
         return holder
 
     # -- ingestion --------------------------------------------------------
@@ -121,14 +186,32 @@ class SeatLedger:
         if ts is None:
             return
         login = event.user_login
-        # Resolve external id -> real login if the event lacks a login.
-        external_id = None
         if not login:
             return  # audit events without any subject are unusable
-        holder = self._holder(login, event.org_login, external_id, source="audit_log", user_id=event.user_id)
+        # A deprovisioned EMU seat holder may appear in the audit log with an
+        # obfuscated login; resolve it to the real handle (keeping the obfuscated id
+        # in external_identity) so it merges with seat/AIC data keyed by real login.
+        if is_obfuscated_login(login):
+            resolution = self.resolver.resolve(external_id=login)
+            if not resolution.user_login:
+                core = extract_guid(login)
+                if core and core != login:
+                    resolution = self.resolver.resolve(external_id=core)
+            holder = self._holder(
+                resolution.user_login,
+                event.org_login,
+                external_id=login,
+                source=resolution.source if resolution.user_login else "audit_log",
+                user_id=event.user_id,
+            )
+            holder.suspended = True
+            if not holder.external_identity:
+                holder.external_identity = login
+        else:
+            holder = self._holder(login, event.org_login, None, source="audit_log", user_id=event.user_id)
         if event.action.endswith(ASSIGN_SUFFIXES):
             holder.assigns.append(ts)
-        elif event.action.endswith(CANCEL_SUFFIX):
+        elif event.action.endswith(CANCEL_SUFFIXES):
             holder.cancels.append(ts)
 
     def add_live_seat(self, seat: Seat) -> None:
@@ -177,7 +260,7 @@ class SeatLedger:
         no longer resolves against the usage API.
         """
         out: List[tuple] = []
-        for holder in self._holders.values():
+        for holder in self._unique_holders():
             if holder.live_seat is not None and holder.login:
                 out.append((holder.org, holder.login, holder.user_id))
         return out
@@ -187,7 +270,7 @@ class SeatLedger:
         every holder that has both. Used to recover the real login of a
         deprovisioned user whose current seat carries only an obfuscated handle."""
         index: Dict[int, str] = {}
-        for holder in self._holders.values():
+        for holder in self._unique_holders():
             if holder.user_id is None or not holder.login:
                 continue
             if is_obfuscated_login(holder.login):
@@ -251,7 +334,7 @@ class SeatLedger:
 
         cycle_start, cycle_end = cycle_bounds_utc(period)
         out: List[MaterializedSeat] = []
-        for holder in self._holders.values():
+        for holder in self._unique_holders():
             intervals = self._intervals_for(holder)
             for interval in intervals:
                 if not interval_overlaps_period(interval.assigned_at, interval.revoked_at, period):

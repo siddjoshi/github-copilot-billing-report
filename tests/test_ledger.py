@@ -9,7 +9,7 @@ def _ms(y, m, d):
     return int(dt.datetime(y, m, d, tzinfo=dt.timezone.utc).timestamp() * 1000)
 
 
-def _seat(login, org, created, pending=None, plan="business", team=None, uid=1):
+def _seat(login, org, created, pending=None, plan="business", team=None, uid=None):
     return Seat(
         org_login=org,
         assignee_login=login,
@@ -105,6 +105,71 @@ def test_pending_cancellation_future_cycle_still_sets_revoked_date():
     assert r.seat_status == "pending_cancellation"
     assert r.user_status == "inactive"
     assert r.user_revoked_date == "2026-09-30"
+
+
+def test_audit_cfb_action_names_reconstruct_removed_user():
+    # Real GitHub emits cfb_ action names; a user added in April and unassigned in
+    # June must reconstruct as licensed-in-June, inactive, with a revoke date.
+    led = SeatLedger()
+    led.add_audit_event(AuditEvent("copilot.cfb_seat_added", "octo", "acme", _ms(2026, 4, 10), user_id=7))
+    led.add_audit_event(AuditEvent("copilot.cfb_seat_assignment_unassigned", "octo", "acme", _ms(2026, 6, 20), user_id=7))
+    jun = led.materialize_month("2026-06", "now")
+    assert len(jun) == 1
+    assert jun[0].user_status == "inactive"
+    assert jun[0].seat_status == "removed"
+    assert jun[0].user_revoked_date == "2026-06-20"
+    assert jun[0].github_user_id == 7
+    # Gone the next month.
+    assert led.materialize_month("2026-07", "now") == []
+
+
+def test_audit_access_revoked_and_cfb_cancelled_are_cancels():
+    led = SeatLedger()
+    led.add_audit_event(AuditEvent("copilot.cfb_seat_added", "u", "acme", _ms(2026, 1, 1)))
+    led.add_audit_event(AuditEvent("copilot.access_revoked", "u", "acme", _ms(2026, 6, 5)))
+    jun = led.materialize_month("2026-06", "now")
+    assert jun[0].user_status == "inactive"
+    assert jun[0].user_revoked_date == "2026-06-05"
+
+
+def test_audit_cancel_only_in_june_still_materializes():
+    # Assignment predates the audit window; only the June cancel is seen.
+    led = SeatLedger()
+    led.add_audit_event(AuditEvent("copilot.cfb_seat_assignment_unassigned", "u", "acme", _ms(2026, 6, 15)))
+    jun = led.materialize_month("2026-06", "now")
+    assert len(jun) == 1
+    assert jun[0].license_assigned_date == ""
+    assert jun[0].user_revoked_date == "2026-06-15"
+    assert jun[0].user_status == "inactive"
+
+
+def test_split_identity_merges_by_user_id():
+    # Same physical user (user_id=42) appears with a REAL login on the assign event
+    # and an OBFUSCATED login on the cancel event. They must merge into one holder
+    # keyed by user_id: one row, real login preserved, revoke date present.
+    resolver = IdentityResolver()  # cannot resolve the obfuscated hex handle
+    led = SeatLedger(resolver=resolver)
+    led.add_audit_event(AuditEvent("copilot.cfb_seat_added", "Sruthi-10835297_HondaCN", "acme", _ms(2026, 4, 1), user_id=42))
+    led.add_audit_event(AuditEvent("copilot.cfb_seat_cancelled", "20816cd40d6717b7d535f9ed13f38f_HondaCN", "acme", _ms(2026, 6, 20), user_id=42))
+    jun = led.materialize_month("2026-06", "now")
+    assert len(jun) == 1
+    r = jun[0]
+    assert r.user_login == "Sruthi-10835297_HondaCN"  # real login, not obfuscated / not empty
+    assert r.github_user_id == 42
+    assert r.user_revoked_date == "2026-06-20"
+    assert r.user_status == "inactive"
+    assert r.external_identity == "20816cd40d6717b7d535f9ed13f38f_HondaCN"
+
+
+def test_split_identity_merges_regardless_of_event_order():
+    led = SeatLedger()
+    # Cancel (obfuscated) seen BEFORE assign (real) — still merges by user_id.
+    led.add_audit_event(AuditEvent("copilot.cfb_seat_cancelled", "deadbeefdeadbeefdeadbeefdeadbe_HondaCN", "acme", _ms(2026, 6, 20), user_id=99))
+    led.add_audit_event(AuditEvent("copilot.cfb_seat_added", "Real-123_HondaCN", "acme", _ms(2026, 4, 1), user_id=99))
+    jun = led.materialize_month("2026-06", "now")
+    assert len(jun) == 1
+    assert jun[0].user_login == "Real-123_HondaCN"
+    assert jun[0].user_revoked_date == "2026-06-20"
 
 
 def test_snapshot_month_is_authoritative():

@@ -118,7 +118,7 @@ Required columns (fixed order), then recommended/provenance columns.
 | `aic_billing_dollar_assigned` | Per-user budget if configured, else `default_aic_user_level × 0.01`. Rule recorded in `aic_assigned_rule_used`. |
 | `aic_consumed` | Per-user **gross** AI-credits consumed from `.../ai_credit/usage?user=` (`grossQuantity`), plus `aic_consumed_usd` (`grossAmount`, falling back to `grossQuantity × credit_to_usd` when `grossAmount` is absent). This is credits *used*, not the net *billed* amount — usage within the included allowance still counts here even though it bills $0. `0` if none; empty for historical months with no per-user data. |
 | `user_status` | `active` = holds a valid, non-cancelled license; else `inactive` (removed / pending_cancellation / suspended / deprovisioned). |
-| `user_revoked_date` | `pending_cancellation_date` if set (including cancellations scheduled for a future cycle), else latest `copilot.seat_cancelled` from audit, else the SCIM deprovisioning timestamp (`meta.lastModified`) for suspended/deprovisioned accounts; empty only if active/never-revoked. |
+| `user_revoked_date` | `pending_cancellation_date` if set (including cancellations scheduled for a future cycle), else latest cancel event from audit (`copilot.cfb_seat_cancelled` / `cfb_seat_assignment_unassigned` / `access_revoked` / legacy `seat_cancelled`), else the SCIM deprovisioning timestamp (`meta.lastModified`) for suspended/deprovisioned accounts; empty only if active/never-revoked. |
 | `org_login` | Instance (org) login. |
 | `plan_type` | `business` / `enterprise` / `unknown` (normalized). |
 | `seat_status` | `active` / `pending_cancellation` / `removed`. |
@@ -147,8 +147,14 @@ users. To report past months the tool builds a longitudinal **seat ledger**:
 
 1. **Ingest** (widest history first): audit archive (unbounded) → audit-log API
    (~180 days) → stored snapshots (exact) → current live seats (exact).
-2. **Build intervals** `[assigned_at → revoked_at)` per `(user, org)`; the real login
-   is captured at ingest time so it survives later removal.
+   Copilot seat events are matched under **both** the modern `copilot.cfb_*` action
+   names (`cfb_seat_added`, `cfb_seat_assignment_created` = assign;
+   `cfb_seat_cancelled`, `cfb_seat_assignment_unassigned`, `access_revoked` = cancel)
+   and the legacy `copilot.seat_assigned`/`copilot.seat_cancelled` names.
+2. **Build intervals** `[assigned_at → revoked_at)` per user; events are keyed by the
+   permanent numeric **user id** so a user who appears with both a real login and an
+   obfuscated (deprovisioned EMU) handle merges into one record. The real login is
+   captured at ingest time so it survives later removal.
 3. **Materialize** each requested month: a user is licensed if any interval overlaps
    the month's cycle. Snapshots are authoritative (`exact`); otherwise
    `audit_reconstructed`.
