@@ -378,7 +378,7 @@ def test_remap_deprovisioned_forces_inactive_end_to_end(tmp_path, monkeypatch):
     class DeprovSession(RoutingSession):
         def request(self, method, url, params=None, json=None, headers=None, timeout=None):
             if "/scim/v2/enterprises/" in url:
-                return FakeResponse(200, {"Resources": [{"userName": "mona.svc", "active": False}], "totalResults": 1}, headers={})
+                return FakeResponse(200, {"Resources": [{"userName": "mona.svc", "active": False, "meta": {"lastModified": "2026-05-14T09:30:00Z"}}], "totalResults": 1}, headers={})
             return super().request(method, url, params, json, headers, timeout)
 
     import copilot_aic_report.github_client as gc
@@ -397,6 +397,8 @@ def test_remap_deprovisioned_forces_inactive_end_to_end(tmp_path, monkeypatch):
     assert r["user_login"] == "mona_acme"
     assert r["user_status"] == "inactive"
     assert r["account_state"] == "deprovisioned"
+    # The SCIM deprovisioning timestamp is surfaced as the revoke date.
+    assert r["user_revoked_date"] == "2026-05-14"
 
 
 class CountingSession(RoutingSession):

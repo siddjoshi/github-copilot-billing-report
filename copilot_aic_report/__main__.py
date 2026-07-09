@@ -19,7 +19,7 @@ from .github_client import AuthFailure, GitHubClient, GitHubError
 from .ledger import SeatLedger
 from .models import AccountState, AicConsumption, IdentityMapEntry
 from .periods import earliest_recoverable_month, parse_report_months
-from .resolve import IdentityResolver
+from .resolve import IdentityResolver, is_obfuscated_login
 from .run_log import RunLog
 from . import csv_writer, snapshots
 from .reconcile import run_all, summarize_history
@@ -113,6 +113,22 @@ def _remap_scim_active_to_login(
             out[login.lower()] = active
         else:
             out[user_name] = active  # userName may already be the login
+    return out
+
+
+def _remap_scim_value_to_login(
+    values: Dict[str, str],
+    identity_index: Dict[str, str],
+) -> Dict[str, str]:
+    """Remap an arbitrary SCIM ``userName``-keyed value map (e.g. deprovision
+    dates) to GitHub-login keys, mirroring :func:`_remap_scim_active_to_login`."""
+    out: Dict[str, str] = {}
+    for user_name, value in values.items():
+        login = identity_index.get(user_name)
+        if login:
+            out[login.lower()] = value
+        else:
+            out[user_name] = value
     return out
 
 
@@ -335,6 +351,7 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
     # SCIM ``active`` / suspended state.
     org_members_by_org: Dict[str, set] = {}
     scim_active: Dict[str, bool] = {}
+    scim_deprovisioned_at: Dict[str, str] = {}
     try:
         if cfg.fetch_membership:
             for org in org_logins:
@@ -342,7 +359,7 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
         else:
             for org, logins in seat_logins_by_org.items():
                 org_members_by_org[org] = {login.lower() for login in logins}
-        scim_active = membership.fetch_scim_active(client, cfg)
+        scim_active, scim_deprovisioned_at = membership.fetch_scim_state(client, cfg)
     except AuthFailure:
         raise
     except Exception as exc:  # pragma: no cover
@@ -351,7 +368,10 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
     # GitHub login under EMU/SSO). Remap it to GitHub logins via the identity index so
     # the deprovisioned -> inactive downgrade in build_rows actually fires.
     scim_active_by_login = _remap_scim_active_to_login(scim_active, identity_index)
-    account_state_list = membership.build_account_states(org_members_by_org, scim_active_by_login, seat_logins_by_org)
+    scim_deprovisioned_at_by_login = _remap_scim_value_to_login(scim_deprovisioned_at, identity_index)
+    account_state_list = membership.build_account_states(
+        org_members_by_org, scim_active_by_login, seat_logins_by_org, scim_deprovisioned_at_by_login
+    )
     account_states = {(a.org_login, (a.user_login or "").lower()): a for a in account_state_list}
 
     # -- billing usage (optional, per requested period aggregate) --
@@ -369,6 +389,26 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
     consumption_rows, consumption_source = aic_consumption.get_consumption(client, cfg, aic_holders)
     log.aic_consumption_source = consumption_source
     consumption_index = index_consumption(consumption_rows)
+    # Recover the real login of deprovisioned users (obfuscated seat handle) by
+    # matching the permanent numeric user id against sources that still hold a real
+    # login (audit history / other live seats / snapshots).
+    user_id_to_login = ledger.user_id_login_index()
+    # Augment with real logins captured in prior stored snapshots (a user active
+    # last month, deprovisioned this month, can still be recovered by id).
+    if cfg.snapshot_store:
+        for snap_period in snapshots.list_snapshot_months(cfg.snapshot_store):
+            for rec in snapshots.read_snapshot_records(cfg.snapshot_store, snap_period) or []:
+                uid = rec.get("github_user_id")
+                rlogin = rec.get("resolved_user_login") or rec.get("user_login")
+                if uid in (None, "") or not rlogin:
+                    continue
+                try:
+                    uid_int = int(uid)
+                except (TypeError, ValueError):
+                    continue
+                if is_obfuscated_login(str(rlogin)):
+                    continue
+                user_id_to_login.setdefault(uid_int, str(rlogin))
     per_user_has_consumption = consumption_source != "none"
     if per_user_has_consumption:
         log.warn(
@@ -400,6 +440,8 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
             account_states=account_states,
             org_plan_by_org=org_plan_by_org,
             per_user_has_consumption=per_user_has_consumption if is_current else False,
+            user_id_to_login=user_id_to_login,
+            deprovisioned_at_by_login=scim_deprovisioned_at_by_login,
             generated_at=log.started_at,
         )
         # Override each row's billing_period to the materialized period.

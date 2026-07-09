@@ -134,6 +134,32 @@ def test_paginate_items_key():
     assert items == [{"a": 1}]
 
 
+def test_paginate_scim_startindex():
+    # SCIM v2 has no Link header; paginate must follow startIndex/count/totalResults.
+    page1 = FakeResponse(
+        200,
+        {"totalResults": 5, "startIndex": 1, "itemsPerPage": 2,
+         "Resources": [{"userName": "a"}, {"userName": "b"}]},
+        headers={},
+    )
+    page2 = FakeResponse(
+        200,
+        {"totalResults": 5, "startIndex": 3, "itemsPerPage": 2,
+         "Resources": [{"userName": "c"}, {"userName": "d"}]},
+        headers={},
+    )
+    page3 = FakeResponse(
+        200,
+        {"totalResults": 5, "startIndex": 5, "itemsPerPage": 2,
+         "Resources": [{"userName": "e"}]},
+        headers={},
+    )
+    sess = FakeSession([page1, page2, page3])
+    client = make_client(sess)
+    items = list(client.paginate("/scim/v2/enterprises/x/Users", items_key="Resources"))
+    assert [i["userName"] for i in items] == ["a", "b", "c", "d", "e"]
+
+
 def test_graphql_success():
     sess = FakeSession([FakeResponse(200, {"data": {"x": 1}})])
     client = make_client(sess)

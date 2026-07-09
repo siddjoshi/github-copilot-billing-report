@@ -82,8 +82,20 @@ def _to_audit_event(raw: Any, org_login: Optional[str]) -> AuditEvent:
         user_login=_extract_login(event),
         org_login=_extract_org_login(event, org_login),
         timestamp_ms=event.get("@timestamp"),
+        user_id=_extract_user_id(event),
         raw=event,
     )
+
+
+def _extract_user_id(event: dict[str, Any]) -> Optional[int]:
+    for key in ("user_id", "userId", "actor_id", "actorId"):
+        if key in event:
+            value = event.get(key)
+            try:
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def _extract_login(event: dict[str, Any]) -> Optional[str]:

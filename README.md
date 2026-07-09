@@ -82,8 +82,11 @@ limited tokens; pass `--orgs` to scope to specific organizations.
 Per-user AIC consumption comes from
 `GET /enterprises/{ent}/settings/billing/ai_credit/usage?user={login}` — one call per
 user. For large enterprises this is fetched concurrently (`aic_concurrency`, default 8).
-For the fastest bulk load, export the premium-request/AI-credit report from the billing
-UI and pass it with `--aic-csv` (also required for accurate historical months).
+For deprovisioned EMU users whose seat carries only an obfuscated login, the lookup
+retries best-effort with the permanent numeric `github_user_id` (`?user={id}`) so their
+usage is still captured. For the fastest bulk load, export the premium-request/AI-credit
+report from the billing UI and pass it with `--aic-csv` (also required for accurate
+historical months).
 
 ---
 
@@ -115,13 +118,15 @@ Required columns (fixed order), then recommended/provenance columns.
 | `aic_billing_dollar_assigned` | Per-user budget if configured, else `default_aic_user_level × 0.01`. Rule recorded in `aic_assigned_rule_used`. |
 | `aic_consumed` | Per-user **gross** AI-credits consumed from `.../ai_credit/usage?user=` (`grossQuantity`), plus `aic_consumed_usd` (`grossAmount`, falling back to `grossQuantity × credit_to_usd` when `grossAmount` is absent). This is credits *used*, not the net *billed* amount — usage within the included allowance still counts here even though it bills $0. `0` if none; empty for historical months with no per-user data. |
 | `user_status` | `active` = holds a valid, non-cancelled license; else `inactive` (removed / pending_cancellation / suspended / deprovisioned). |
-| `user_revoked_date` | `pending_cancellation_date` if set, else latest `copilot.seat_cancelled` from audit; empty if active/never-revoked. |
+| `user_revoked_date` | `pending_cancellation_date` if set (including cancellations scheduled for a future cycle), else latest `copilot.seat_cancelled` from audit, else the SCIM deprovisioning timestamp (`meta.lastModified`) for suspended/deprovisioned accounts; empty only if active/never-revoked. |
 | `org_login` | Instance (org) login. |
 | `plan_type` | `business` / `enterprise` / `unknown` (normalized). |
 | `seat_status` | `active` / `pending_cancellation` / `removed`. |
 | `assigned_via` | `direct` or `team:<slug>`. |
 | `last_activity_at` | From seat telemetry (informational; not the status driver). |
-| `external_identity` | SAML NameID / SCIM userName — captured here ONLY, never in `user_login`. |
+| `external_identity` | SAML NameID / SCIM userName — captured here ONLY, never in `user_login`. For deprovisioned EMU accounts also holds the obfuscated GUID/hex handle. |
+| `github_user_id` | Permanent **numeric** GitHub user id (`assignee.id`). Always present when known and stable across renames/deprovisioning — the reliable real identifier for revoked users whose `user_login` is an obfuscated hash. |
+| `resolved_user_login` | Best-effort real login. For a normal user this equals `user_login`; for a deprovisioned user (obfuscated `user_login`) it is recovered by matching `github_user_id` against audit history / other live seats / prior snapshots, else empty. |
 | `identity_resolution_source` | `seat` / `audit` / `externalIdentities` / `identity_map` / `snapshot` / `unresolved`. |
 | `account_state` | `member` / `suspended` / `deprovisioned`. |
 | `aic_assigned_rule_used` | `per_user_budget` / `plan_default`. |

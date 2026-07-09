@@ -6,6 +6,7 @@ from copilot_aic_report.sources.membership import (
     build_account_states,
     fetch_org_members,
     fetch_scim_active,
+    fetch_scim_state,
 )
 
 
@@ -86,6 +87,35 @@ def test_fetch_scim_active_propagates_auth_failure():
 
     with pytest.raises(AuthFailure):
         fetch_scim_active(client, Config(enterprise_slug="acme"))
+
+
+def test_fetch_scim_state_returns_active_and_deprovisioned_dates():
+    client = FakeClient(
+        {
+            ("/scim/v2/enterprises/acme/Users", "Resources"): [
+                {"userName": "Mona", "active": True, "meta": {"lastModified": "2026-01-01T00:00:00Z"}},
+                {"userName": "HUBOT", "active": False, "meta": {"lastModified": "2026-05-14T09:30:00Z"}},
+                {"userName": "NoDate", "active": False},
+                {"active": False, "meta": {"lastModified": "2026-01-01T00:00:00Z"}},
+            ]
+        }
+    )
+
+    active, deprovisioned_at = fetch_scim_state(client, Config(enterprise_slug="acme"))
+
+    assert active == {"mona": True, "hubot": False, "nodate": False}
+    # Only inactive users with a lastModified are recorded.
+    assert deprovisioned_at == {"hubot": "2026-05-14T09:30:00Z"}
+
+
+def test_build_account_states_carries_deprovisioned_at():
+    states = build_account_states(
+        org_members_by_org={"octo": set()},
+        scim_active={"mona": False},
+        seat_logins_by_org={"octo": {"Mona"}},
+        scim_deprovisioned_at={"mona": "2026-05-14T09:30:00Z"},
+    )
+    assert states[0].deprovisioned_at == "2026-05-14T09:30:00Z"
 
 
 def test_build_account_states_uses_membership_and_scim_state_outcomes():

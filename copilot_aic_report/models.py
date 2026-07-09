@@ -92,6 +92,7 @@ class AuditEvent:
     user_login: Optional[str]  # REAL handle of the seat holder
     org_login: Optional[str]
     timestamp_ms: Optional[int]  # @timestamp in epoch millis
+    user_id: Optional[int] = None  # numeric GitHub user id of the seat holder
     raw: Dict = field(default_factory=dict)
 
 
@@ -104,6 +105,7 @@ class AccountState:
     is_member: bool = False
     suspended: bool = False
     scim_active: Optional[bool] = None
+    deprovisioned_at: Optional[str] = None  # SCIM meta.lastModified when inactive
 
     def state(self) -> str:
         if self.suspended:

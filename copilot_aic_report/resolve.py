@@ -25,6 +25,12 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 
+# Deprovisioned EMU accounts may also surface with an *obfuscated* login: a long
+# hex string (typically 30-32 chars, no dashes), optionally followed by an
+# ``_shortcode`` suffix (e.g. ``4eb6538565c3d97ad2917d606ccdc4_LTIMPG``). This is
+# NOT a real handle; the real numeric user id must be used to identify the user.
+_OBFUSCATED_HEX_RE = re.compile(r"^[0-9a-fA-F]{20,}$")
+
 
 def _norm(value: Optional[str]) -> Optional[str]:
     if value is None:
@@ -162,3 +168,22 @@ def extract_guid(login: Optional[str]) -> Optional[str]:
         return None
     match = _UUID_RE.search(str(login))
     return match.group(0) if match else None
+
+
+def is_obfuscated_login(login: Optional[str]) -> bool:
+    """True if ``login`` is an obfuscated/placeholder handle for a deprovisioned
+    EMU account rather than a real GitHub handle.
+
+    Covers two GitHub forms:
+      * a GUID (optionally ``_shortcode`` suffixed), and
+      * a long hex string (>=20 hex chars, no dashes), optionally ``_shortcode``
+        suffixed, e.g. ``4eb6538565c3d97ad2917d606ccdc4_LTIMPG``.
+    """
+    if not login:
+        return False
+    if is_placeholder_login(login):
+        return True
+    core = str(login).strip()
+    if "_" in core:
+        core = core.rsplit("_", 1)[0]
+    return bool(_OBFUSCATED_HEX_RE.match(core))

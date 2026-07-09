@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .models import AuditEvent, Seat
 from .periods import cycle_bounds_utc, interval_overlaps_period
-from .resolve import IdentityResolver, canonicalize_login, extract_guid, is_placeholder_login
+from .resolve import IdentityResolver, canonicalize_login, extract_guid, is_obfuscated_login, is_placeholder_login
 from .util import epoch_ms_to_utc_datetime, to_utc_datetime
 
 ASSIGN_SUFFIXES = ("seat_assigned", "seat_refresh")
@@ -50,6 +50,7 @@ class MaterializedSeat:
     history_confidence: str  # exact | reconstructed | aggregate_only | unknown
     as_of_utc: str
     external_identity: Optional[str] = None
+    github_user_id: Optional[int] = None
     plan_type: Optional[str] = None
     last_activity_at: Optional[str] = None
     assigned_via: Optional[str] = None
@@ -67,6 +68,7 @@ class _Holder:
     org: str
     external_identity: Optional[str] = None
     login_source: str = "UNRECOVERABLE"
+    user_id: Optional[int] = None
     assigns: List[_dt.datetime] = field(default_factory=list)
     cancels: List[_dt.datetime] = field(default_factory=list)
     live_seat: Optional[Seat] = None
@@ -86,7 +88,7 @@ class SeatLedger:
         ident = (canonicalize_login(login) or ("ext:" + (external_id or "unknown"))).lower()
         return (ident, org)
 
-    def _holder(self, login: Optional[str], org: str, external_id: Optional[str], source: str) -> _Holder:
+    def _holder(self, login: Optional[str], org: str, external_id: Optional[str], source: str, user_id: Optional[int] = None) -> _Holder:
         key = self._key(login, org, external_id)
         holder = self._holders.get(key)
         if holder is None:
@@ -96,6 +98,7 @@ class SeatLedger:
                 org=org,
                 external_identity=external_id,
                 login_source=source if resolved_login else "UNRECOVERABLE",
+                user_id=user_id,
             )
             self._holders[key] = holder
         else:
@@ -105,6 +108,8 @@ class SeatLedger:
                 holder.login_source = source
             if not holder.external_identity and external_id:
                 holder.external_identity = external_id
+            if holder.user_id is None and user_id is not None:
+                holder.user_id = user_id
         return holder
 
     # -- ingestion --------------------------------------------------------
@@ -120,7 +125,7 @@ class SeatLedger:
         external_id = None
         if not login:
             return  # audit events without any subject are unusable
-        holder = self._holder(login, event.org_login, external_id, source="audit_log")
+        holder = self._holder(login, event.org_login, external_id, source="audit_log", user_id=event.user_id)
         if event.action.endswith(ASSIGN_SUFFIXES):
             holder.assigns.append(ts)
         elif event.action.endswith(CANCEL_SUFFIX):
@@ -148,12 +153,13 @@ class SeatLedger:
                 org,
                 external_id=login,
                 source=resolution.source if resolution.user_login else "seat",
+                user_id=seat.assignee_id,
             )
             holder.suspended = True
             if not holder.external_identity:
                 holder.external_identity = login
         else:
-            holder = self._holder(login, org, None, source="seat")
+            holder = self._holder(login, org, None, source="seat", user_id=seat.assignee_id)
         holder.live_seat = seat
         assigned = to_utc_datetime(seat.created_at)
         if assigned is not None:
@@ -163,16 +169,31 @@ class SeatLedger:
         self.snapshots[period] = list(records or [])
 
     def live_seat_holders(self) -> List[tuple]:
-        """Return ``(org, login)`` pairs for current live seats with a real login.
+        """Return ``(org, login, user_id)`` for current live seats with a real login.
 
         Used to query per-user AIC consumption by the resolved GitHub login (never
-        a GUID placeholder).
+        a GUID/obfuscated placeholder). The numeric ``user_id`` is included so the
+        AIC lookup can fall back to it for deprovisioned users whose login handle
+        no longer resolves against the usage API.
         """
         out: List[tuple] = []
         for holder in self._holders.values():
             if holder.live_seat is not None and holder.login:
-                out.append((holder.org, holder.login))
+                out.append((holder.org, holder.login, holder.user_id))
         return out
+
+    def user_id_login_index(self) -> Dict[int, str]:
+        """Map numeric GitHub user id -> real (non-obfuscated) login, built from
+        every holder that has both. Used to recover the real login of a
+        deprovisioned user whose current seat carries only an obfuscated handle."""
+        index: Dict[int, str] = {}
+        for holder in self._holders.values():
+            if holder.user_id is None or not holder.login:
+                continue
+            if is_obfuscated_login(holder.login):
+                continue
+            index.setdefault(holder.user_id, holder.login)
+        return index
 
     # -- interval construction -------------------------------------------
 
@@ -266,6 +287,9 @@ class SeatLedger:
         elif interval.pending_cancellation_at is not None:
             seat_status = "pending_cancellation"
             user_status = "inactive"
+            # A scheduled cancellation is a revocation even when it falls in a future
+            # cycle; surface its date so revoked users always carry a revoke date.
+            revoked_date = interval.pending_cancellation_at.date().isoformat()
 
         if interval.origin == "live_seat":
             row_source = "live_seats"
@@ -306,6 +330,7 @@ class SeatLedger:
             history_confidence=history_confidence,
             as_of_utc=now_iso,
             external_identity=external_identity,
+            github_user_id=holder.user_id,
             plan_type=seat.plan_type if seat else None,
             last_activity_at=seat.last_activity_at if seat else None,
             assigned_via=(f"team:{seat.assigning_team_slug}" if seat and seat.assigning_team_slug else ("direct" if seat else None)),
@@ -329,6 +354,7 @@ def _from_snapshot_record(rec: dict, period: str, now_iso: str) -> MaterializedS
         history_confidence="exact",
         as_of_utc=rec.get("as_of_utc", now_iso),
         external_identity=rec.get("external_identity"),
+        github_user_id=rec.get("github_user_id"),
         plan_type=rec.get("plan_type"),
         last_activity_at=rec.get("last_activity_at"),
         assigned_via=rec.get("assigned_via"),
