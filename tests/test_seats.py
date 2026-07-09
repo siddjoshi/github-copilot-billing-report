@@ -1,6 +1,6 @@
 from copilot_aic_report.config import Config
 from copilot_aic_report.models import Seat
-from copilot_aic_report.sources.seats import fetch_all_seats, fetch_seats
+from copilot_aic_report.sources.seats import fetch_all_seats, fetch_enterprise_seats, fetch_seats
 
 
 class FakeClient:
@@ -109,3 +109,21 @@ def test_fetch_seats_empty_result_returns_empty_list():
 
 def test_fetch_all_seats_empty_org_list_returns_empty_list():
     assert fetch_all_seats(FakeClient(), Config(), []) == []
+
+
+def test_fetch_enterprise_seats_uses_org_attribution():
+    seat = {"assignee": {"login": "alice"}, "organization": {"login": "acme"}, "plan_type": "enterprise"}
+    client = FakeClient({"/enterprises/ent1/copilot/billing/seats": [seat]})
+    seats = fetch_enterprise_seats(client, Config(enterprise_slug="ent1"))
+    assert seats[0].org_login == "acme"
+    assert seats[0].assignee_login == "alice"
+
+
+def test_fetch_enterprise_seats_direct_assignment_falls_back_to_enterprise():
+    # Enterprise-direct assignment: organization is None -> attribute to enterprise slug,
+    # not "" (which previously caused the seat to be dropped downstream).
+    seat = {"assignee": {"login": "Hemant_HondaCN"}, "organization": None, "plan_type": "business"}
+    client = FakeClient({"/enterprises/hondacn/copilot/billing/seats": [seat]})
+    seats = fetch_enterprise_seats(client, Config(enterprise_slug="hondacn"))
+    assert seats[0].org_login == "enterprise:hondacn"
+    assert seats[0].assignee_login == "Hemant_HondaCN"

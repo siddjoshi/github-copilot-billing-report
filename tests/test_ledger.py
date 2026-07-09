@@ -164,3 +164,14 @@ def test_live_seat_holders_uses_real_login():
     holders = set(led.live_seat_holders())
     assert ("acme", "mona_acme") in holders
     assert ("globex", "octo") in holders
+
+
+def test_enterprise_direct_seat_without_org_is_not_dropped():
+    # Enterprise-direct seats may have an empty org_login; they must still produce a
+    # holder/row rather than being silently discarded.
+    led = SeatLedger()
+    led.add_live_seat(_seat("Hemant_HondaCN", "", "2026-01-20T00:00:00Z"))
+    rows = led.materialize_month("2026-06", "now")
+    assert len(rows) == 1
+    assert rows[0].user_login == "Hemant_HondaCN"
+    assert rows[0].user_status == "active"

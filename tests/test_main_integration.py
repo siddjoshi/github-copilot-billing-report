@@ -544,6 +544,33 @@ def test_enterprise_seats_preferred_no_per_org_seat_calls(tmp_path, monkeypatch)
     assert rows[0]["org_login"] == "acme"  # org attribution from enterprise seat
 
 
+def test_enterprise_direct_seats_produce_rows(tmp_path, monkeypatch):
+    # Enterprise-direct assignment: seats have organization=None. They must be
+    # attributed to 'enterprise:<slug>' and appear in the report (not dropped).
+    class DirectSession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(200, {"total_seats": 1, "seats": [{
+                    "assignee": {"login": "Hemant_HondaCN", "id": 7, "type": "User"},
+                    "organization": None,
+                    "created_at": "2026-01-20T00:00:00Z",
+                    "pending_cancellation_date": None,
+                    "plan_type": "business",
+                }]}, headers={})
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": DirectSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    log = cli.run(cfg)
+    assert log.rows_written == 1
+    with open(cfg.output_path, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows[0]["user_login"] == "Hemant_HondaCN"
+    assert rows[0]["org_login"] == "enterprise:acme"
+
+
+
 def test_suspended_guid_user_live_end_to_end(tmp_path, monkeypatch):
     # A suspended EMU user surfaces with a GUID login on the enterprise seats endpoint.
     guid = "2f1c8e4a-1234-4abc-9def-0123456789ab"

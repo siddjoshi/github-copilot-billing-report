@@ -258,7 +258,7 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
             print(
                 "[copilot-aic-report] enterprise-wide seats endpoint returned no seats. "
                 "The enterprise may simply have no assigned Copilot seats for this "
-                "period.",
+                "period (note: seats are point-in-time; try the current month).",
                 file=sys.stderr,
             )
         else:
