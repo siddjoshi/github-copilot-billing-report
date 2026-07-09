@@ -82,21 +82,23 @@ def fetch_from_api(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> list
 
     rate = float(cfg.credit_to_usd)
     unavailable = threading.Event()
-    auth_failure: list = []
+    auth_failures: list = []
 
     def _query(user_key: str, *, is_fallback: bool) -> Optional[list]:
         """Return usageItems for one user key, or None if nothing/unavailable.
 
-        A primary (login) query treats a hard 403/404/410 as "endpoint
-        unavailable" (so callers fall back to CSV). A fallback (user-id) query
-        swallows those errors locally without aborting the whole run.
+        A primary (login) query records a 401/403 (raised only after the client has
+        exhausted its rate-limit retries) without aborting the whole batch: a
+        transient per-user secondary-rate-limit must not zero out every other
+        user's consumption. A hard 404/410 marks the endpoint itself unavailable
+        (so callers can fall back to CSV). A fallback (user-id) query swallows
+        those errors locally.
         """
         try:
             payload = client.get(endpoint, params={**params_base, "user": user_key})
         except AuthFailure as exc:
-            if is_fallback:
-                return None
-            auth_failure.append(exc)
+            if not is_fallback:
+                auth_failures.append(exc)
             return None
         except GitHubError as exc:
             if exc.status in (403, 404, 410):
@@ -109,12 +111,14 @@ def fetch_from_api(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> list
 
     def _fetch_one(entry: tuple) -> Optional[AicConsumption]:
         login, user_id = entry
-        if unavailable.is_set() or auth_failure:
+        # Only short-circuit when the endpoint itself is unavailable (404/410); a
+        # per-user auth/rate-limit failure must not skip the remaining users.
+        if unavailable.is_set():
             return None
         items = _query(login, is_fallback=False)
         # Deprovisioned users: the obfuscated login often yields nothing; retry by
         # the permanent numeric user id (best-effort).
-        if not items and user_id is not None and not unavailable.is_set() and not auth_failure:
+        if not items and user_id is not None and not unavailable.is_set():
             items = _query(str(user_id), is_fallback=True)
         if not items:
             return None
@@ -144,10 +148,14 @@ def fetch_from_api(client: Any, cfg: Any, holders: Iterable[tuple] = ()) -> list
             results = list(pool.map(_fetch_one, unique))
     rows = [r for r in results if r is not None]
 
-    if auth_failure:
-        raise AicSourceUnavailable("AIC consumption API is not accessible") from auth_failure[0]
-    if not rows and unavailable.is_set():
-        raise AicSourceUnavailable("enterprise AIC usage endpoint unavailable")
+    # Only declare the source unavailable when we got NOTHING at all. If any user
+    # returned data the endpoint clearly works, so partial per-user auth/rate-limit
+    # failures are tolerated rather than discarding every user's consumption.
+    if not rows:
+        if unavailable.is_set():
+            raise AicSourceUnavailable("enterprise AIC usage endpoint unavailable")
+        if auth_failures:
+            raise AicSourceUnavailable("AIC consumption API is not accessible") from auth_failures[0]
     return rows
 
 
