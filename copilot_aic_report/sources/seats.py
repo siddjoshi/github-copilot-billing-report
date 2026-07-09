@@ -44,12 +44,15 @@ def _org_login_of(raw_seat: dict, fallback: str = "") -> str:
 def fetch_enterprise_seats(client, cfg) -> list[Seat]:
     """Fetch every Copilot seat across the enterprise in one paginated call.
 
-    Each seat carries an ``organization`` field used for per-instance attribution.
+    Each seat may carry an ``organization`` field used for per-instance attribution;
+    enterprise-direct assignments have no organization, so they are attributed to the
+    enterprise slug rather than dropped.
     """
     path = f"/enterprises/{cfg.enterprise_slug}/copilot/billing/seats"
+    fallback_org = f"enterprise:{cfg.enterprise_slug}"
     seats: list[Seat] = []
     for raw_seat in client.paginate(path, items_key="seats"):
-        seats.append(_seat_from_raw(raw_seat, _org_login_of(raw_seat)))
+        seats.append(_seat_from_raw(raw_seat, _org_login_of(raw_seat, fallback_org)))
     return seats
 
 

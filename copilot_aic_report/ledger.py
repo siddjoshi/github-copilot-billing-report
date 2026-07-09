@@ -127,8 +127,11 @@ class SeatLedger:
             holder.cancels.append(ts)
 
     def add_live_seat(self, seat: Seat) -> None:
-        if not seat.org_login:
+        # Enterprise-direct seats have no organization; still process them. Only skip
+        # seats that carry no usable identity at all.
+        if not seat.assignee_login and not seat.org_login:
             return
+        org = seat.org_login or ""
         login = seat.assignee_login
         if login and is_placeholder_login(login):
             # Suspended/deprovisioned EMU account: the seat carries a GUID placeholder
@@ -142,7 +145,7 @@ class SeatLedger:
                     resolution = self.resolver.resolve(external_id=core)
             holder = self._holder(
                 resolution.user_login,
-                seat.org_login,
+                org,
                 external_id=login,
                 source=resolution.source if resolution.user_login else "seat",
             )
@@ -150,7 +153,7 @@ class SeatLedger:
             if not holder.external_identity:
                 holder.external_identity = login
         else:
-            holder = self._holder(login, seat.org_login, None, source="seat")
+            holder = self._holder(login, org, None, source="seat")
         holder.live_seat = seat
         assigned = to_utc_datetime(seat.created_at)
         if assigned is not None:
