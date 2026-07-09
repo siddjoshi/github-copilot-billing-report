@@ -52,16 +52,27 @@ def check_aic_reconciliation(
     tolerance_frac: float = 0.05,
     period: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Σ per-user aic_consumed USD ≈ Copilot net AIC amount from billing usage."""
+    """Reconcile Σ per-user aic_consumed (gross USD) against the billed net.
+
+    ``aic_consumed`` is gross consumption; billing usage ``net`` is the amount billed
+    after the included allowance. Net is therefore ``<= gross`` and is often 0 when all
+    consumption is within the allowance — that is expected, not a mismatch. We flag only
+    the impossible case where billed net exceeds gross consumption beyond tolerance.
+    """
     scoped = [r for r in rows if period is None or str(r.get("billing_period")) == period]
     per_user_sum = sum(_to_float(r.get("aic_consumed_usd")) or 0.0 for r in scoped)
-    net = copilot_net_usd(usage_lines)
-    if net == 0:
-        ok = per_user_sum == 0
-        detail = f"per_user_usd={per_user_sum:.2f}; billing_net=0 (no copilot net to compare)"
+    # Scope billing-usage lines to the same month so multi-period runs don't all
+    # compare against the same (full) net total.
+    if period is not None:
+        scoped_lines = [ln for ln in usage_lines if str(getattr(ln, "date", "") or "").startswith(period)]
     else:
-        ok = abs(per_user_sum - net) <= abs(net) * tolerance_frac
-        detail = f"per_user_usd={per_user_sum:.2f} vs billing_net_usd={net:.2f} (tol={tolerance_frac:.0%})"
+        scoped_lines = usage_lines
+    net = copilot_net_usd(scoped_lines)
+    ok = net <= per_user_sum * (1 + tolerance_frac) + 1e-9
+    detail = (
+        f"per_user_gross_usd={per_user_sum:.2f}; billing_net_usd={net:.2f} "
+        f"(net should be <= gross; within-allowance usage bills 0)"
+    )
     return {"name": f"aic_reconciliation{f'[{period}]' if period else ''}", "ok": ok, "detail": detail}
 
 

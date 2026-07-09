@@ -235,6 +235,122 @@ def test_run_degraded_optional_scopes(tmp_path, monkeypatch):
     assert any("optional scope" in w for w in log.warnings)
 
 
+class StandaloneEnterpriseSession(RoutingSession):
+    """Simulates a token that cannot see the enterprise itself.
+
+    The enterprise-wide Copilot seats endpoint 404s and GraphQL enterprise org
+    discovery returns a null enterprise (partial "Not Found"), but the token can
+    read some organizations' Copilot billing directly via ``/user/orgs``. This is
+    the standalone-Copilot-enterprise / limited-PAT case: discovery must fall back
+    so seats are still reported instead of writing an empty CSV.
+    """
+
+    def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+        if url.endswith("/graphql"):
+            q = (json or {}).get("query", "")
+            if "organizations" in q or "ownerInfo" in q:
+                return FakeResponse(200, {
+                    "data": {"enterprise": None},
+                    "errors": [{"type": "NOT_FOUND", "path": ["enterprise"],
+                                "message": "Could not resolve to an Enterprise"}],
+                })
+            return FakeResponse(200, {"data": {}})
+        if "/enterprises/" in url and "/copilot/billing/seats" in url:
+            return FakeResponse(404, {"message": "Not Found"}, text="Not Found")
+        if url.endswith("/user/orgs"):
+            return FakeResponse(200, [{"login": "acme"}], headers={})
+        return super().request(method, url, params, json, timeout=timeout, headers=headers)
+
+
+def test_falls_back_to_user_orgs_when_enterprise_inaccessible(tmp_path, monkeypatch):
+    import copilot_aic_report.github_client as gc
+
+    def patched(self):
+        if self.session is None:
+            self.session = StandaloneEnterpriseSession()
+        self.sleep = lambda s: None
+
+    monkeypatch.setattr(gc.GitHubClient, "__post_init__", patched)
+    cfg = _make_cfg(tmp_path)
+    log = cli.run(cfg)
+
+    # The enterprise endpoints were inaccessible, but per-org discovery over the
+    # token's own orgs still produced seats -> a non-empty report.
+    assert log.rows_written == 1
+    assert log.seats_found == 1
+    with open(cfg.output_path, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows[0]["user_login"] == "mona_acme"
+    assert rows[0]["org_login"] == "acme"
+    assert any("per-org" in w or "org discovery" in w for w in log.warnings)
+
+
+def test_enterprise_org_discovery_warning_names_enterprise_source(tmp_path, monkeypatch):
+    class EnterpriseDiscoverySession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(404, text='{"message":"Not Found"}')
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": EnterpriseDiscoverySession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    log = cli.run(cfg)
+
+    assert log.rows_written == 1
+    assert any(
+        "org discovery: scanning 1 enterprise organization(s)" in warning
+        and "skipping orgs that reject the token" in warning
+        for warning in log.warnings
+    )
+    assert not any(
+        "not verified enterprise membership" in warning
+        for warning in log.warnings
+        if "org discovery:" in warning
+    )
+
+
+def test_no_seats_message_for_specified_orgs(tmp_path, monkeypatch, capsys):
+    class EmptyExplicitOrgSession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/orgs/empty/copilot/billing/seats" in url:
+                return FakeResponse(200, {"total_seats": 0, "seats": []}, headers={})
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": EmptyExplicitOrgSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    cfg.orgs = ["empty"]
+
+    log = cli.run(cfg)
+    err = capsys.readouterr().err
+
+    assert log.seats_found == 0
+    assert "[copilot-aic-report] no Copilot seats were found for the specified --orgs" in err
+    assert "Verify the org logins" in err
+    assert "enterprise-wide seat endpoint was unavailable" not in err
+
+
+def test_no_seats_message_for_empty_enterprise_endpoint(tmp_path, monkeypatch, capsys):
+    class EmptyEnterpriseSeatSession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(200, {"total_seats": 0, "seats": []}, headers={})
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": EmptyEnterpriseSeatSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+
+    log = cli.run(cfg)
+    err = capsys.readouterr().err
+
+    assert log.seats_found == 0
+    assert "[copilot-aic-report] enterprise-wide seats endpoint returned no seats" in err
+    assert "no assigned Copilot seats for this period" in err
+    assert "enterprise-wide seat endpoint was unavailable" not in err
+
+
 def test_load_identity_map(tmp_path):
     p = tmp_path / "idmap.json"
     p.write_text(
@@ -428,43 +544,31 @@ def test_enterprise_seats_preferred_no_per_org_seat_calls(tmp_path, monkeypatch)
     assert rows[0]["org_login"] == "acme"  # org attribution from enterprise seat
 
 
-def test_empty_enterprise_seats_falls_back_to_per_org(tmp_path, monkeypatch):
-    # Enterprise seats endpoint returns 200 with 0 seats (Copilot managed at org level).
-    # The tool must fall back to per-org discovery and still find the seats.
-    class EmptyEntSession(RoutingSession):
+def test_enterprise_direct_seats_produce_rows(tmp_path, monkeypatch):
+    # Enterprise-direct assignment: seats have organization=None. They must be
+    # attributed to 'enterprise:<slug>' and appear in the report (not dropped).
+    class DirectSession(RoutingSession):
         def request(self, method, url, params=None, json=None, headers=None, timeout=None):
             if "/enterprises/" in url and "/copilot/billing/seats" in url:
-                return FakeResponse(200, {"total_seats": 0, "seats": []}, headers={})
+                return FakeResponse(200, {"total_seats": 1, "seats": [{
+                    "assignee": {"login": "Hemant_HondaCN", "id": 7, "type": "User"},
+                    "organization": None,
+                    "created_at": "2026-01-20T00:00:00Z",
+                    "pending_cancellation_date": None,
+                    "plan_type": "business",
+                }]}, headers={})
             return super().request(method, url, params, json, headers, timeout)
 
-    holder = {"session": EmptyEntSession()}
+    holder = {"session": DirectSession()}
     _patch_counting(monkeypatch, holder)
     cfg = _make_cfg(tmp_path)
     log = cli.run(cfg)
-    assert log.rows_written == 1  # found via per-org fallback
-    assert any("returned 0 seats" in w for w in log.warnings)
+    assert log.rows_written == 1
+    with open(cfg.output_path, "r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows[0]["user_login"] == "Hemant_HondaCN"
+    assert rows[0]["org_login"] == "enterprise:acme"
 
-
-def test_no_seats_emits_actionable_diagnostic(tmp_path, monkeypatch):
-    # Enterprise empty AND no orgs discovered -> clear diagnostic, header-only CSV.
-    class NothingSession(RoutingSession):
-        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
-            if "/enterprises/" in url and "/copilot/billing/seats" in url:
-                return FakeResponse(200, {"total_seats": 0, "seats": []}, headers={})
-            if url.endswith("/graphql"):
-                q = (json or {}).get("query", "")
-                if "organizations" in q:
-                    return FakeResponse(200, {"data": {"enterprise": {"organizations": {
-                        "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [],
-                    }}}})
-            return super().request(method, url, params, json, headers, timeout)
-
-    holder = {"session": NothingSession()}
-    _patch_counting(monkeypatch, holder)
-    cfg = _make_cfg(tmp_path)
-    log = cli.run(cfg)
-    assert log.rows_written == 0
-    assert any("No Copilot seats found" in w for w in log.warnings)
 
 
 def test_suspended_guid_user_live_end_to_end(tmp_path, monkeypatch):
@@ -511,7 +615,7 @@ def test_aic_consumption_populated_end_to_end(tmp_path, monkeypatch):
             if "/settings/billing/ai_credit/usage" in url:
                 return FakeResponse(200, {"timePeriod": {"year": 2026, "month": 7},
                                           "user": (params or {}).get("user"),
-                                          "usageItems": [{"netQuantity": 250, "netAmount": 2.5}]})
+                                          "usageItems": [{"grossQuantity": 250, "grossAmount": 2.5, "netQuantity": 0, "netAmount": 0}]})
             return super().request(method, url, params, json, headers, timeout)
 
     holder = {"session": AicSession()}
