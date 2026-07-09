@@ -241,7 +241,7 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
             "'--enterprise'; (2) the enterprise slug is wrong or the token lacks access "
             "(check github.com/enterprises/<slug> and that the token has manage_billing:copilot / "
             "read:enterprise); (3) the seats were assigned AFTER the requested --billing-period "
-            f"('{cfg.resolve_billing_period()}') — try the current month, since the seats endpoint is "
+            f"('{default_period}') — try the current month, since the seats endpoint is "
             "point-in-time."
         )
         log.warn(msg)
