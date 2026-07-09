@@ -115,6 +115,15 @@ class GitHubClient:
                 except (TypeError, ValueError):
                     return self.backoff_base_seconds
             return self.backoff_base_seconds
+        # Secondary (a.k.a. abuse-detection) rate limits present as a 403/429 that
+        # carries NEITHER Retry-After NOR X-RateLimit-Remaining==0; they are only
+        # identifiable from the response body. Treat them as retryable rate limits
+        # so concurrent per-user calls (e.g. AIC usage) back off instead of being
+        # misclassified as a fatal auth/scope failure.
+        if status in (403, 429):
+            text = _safe_text(response).lower()
+            if "secondary rate limit" in text or "abuse detection" in text:
+                return self.backoff_base_seconds
         return None
 
     # ---- core request ----------------------------------------------------

@@ -90,6 +90,32 @@ def test_rate_limit_reset_header():
     assert client.stats.total_wait_seconds == pytest.approx(5.0)
 
 
+def test_secondary_rate_limit_body_retries_not_authfailure():
+    # A 403 secondary rate limit carries NEITHER Retry-After NOR remaining==0; it is
+    # only identifiable from the body. It must be retried, not raised as AuthFailure.
+    sess = FakeSession(
+        [
+            FakeResponse(403, text="You have exceeded a secondary rate limit", headers={}),
+            FakeResponse(200, {"done": 1}),
+        ]
+    )
+    client = make_client(sess)
+    assert client.get("/x") == {"done": 1}
+    assert client.stats.rate_limit_waits == 1
+
+
+def test_abuse_detection_body_retries_not_authfailure():
+    sess = FakeSession(
+        [
+            FakeResponse(429, text="Please wait - abuse detection triggered", headers={}),
+            FakeResponse(200, {"done": 2}),
+        ]
+    )
+    client = make_client(sess)
+    assert client.get("/x") == {"done": 2}
+    assert client.stats.rate_limit_waits == 1
+
+
 def test_5xx_retry_then_success():
     sess = FakeSession([FakeResponse(500, text="oops"), FakeResponse(200, {"ok": 1})])
     client = make_client(sess)

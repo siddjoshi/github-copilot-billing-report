@@ -131,6 +131,42 @@ def test_fetch_from_api_auth_failure_raises_unavailable():
                        Config(billing_period="2026-07"), [("org", "u")])
 
 
+def test_fetch_from_api_partial_auth_failure_keeps_other_users():
+    # A single user's exhausted-retry 403 (e.g. secondary rate limit) must NOT
+    # discard every other user's consumption — the report showed AIC=0 for
+    # everyone because one auth failure aborted the whole batch.
+    class PartialClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None):
+            self.calls.append((path, params))
+            user = (params or {}).get("user")
+            if user == "boom":
+                raise AuthFailure("forbidden", status=403)
+            if user == "alice":
+                return {"usageItems": [{"grossQuantity": 10, "grossAmount": 0.1}]}
+            return {"usageItems": []}
+
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07", credit_to_usd=0.01, aic_concurrency=1)
+    rows = fetch_from_api(PartialClient(), cfg, [("org", "boom"), ("org", "alice")])
+
+    assert [r.user_login for r in rows] == ["alice"]
+    assert rows[0].credits_consumed == 10.0
+
+
+def test_fetch_from_api_all_auth_failures_still_raises_unavailable():
+    # When EVERY user fails with auth/rate-limit and nothing is collected, the
+    # source is genuinely unavailable so callers can fall back to CSV.
+    class AllFailClient:
+        def get(self, path, params=None):
+            raise AuthFailure("forbidden", status=403)
+
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07", aic_concurrency=1)
+    with pytest.raises(AicSourceUnavailable):
+        fetch_from_api(AllFailClient(), cfg, [("org", "a"), ("org", "b")])
+
+
 def test_fetch_from_api_enterprise_endpoint_404_raises_unavailable():
     # The enterprise endpoint is a single endpoint; a 404 means unavailable.
     with pytest.raises(AicSourceUnavailable):
