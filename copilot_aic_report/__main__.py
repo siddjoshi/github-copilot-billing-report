@@ -189,7 +189,15 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
     if explicit_orgs is None:
         try:
             all_seats = seats_src.fetch_enterprise_seats(client, cfg)
-            used_enterprise_seats = True
+            used_enterprise_seats = bool(all_seats)
+            if not all_seats:
+                # A 200-with-empty response happens when Copilot is managed at the ORG
+                # level (not enterprise-level). Fall back to per-org discovery so those
+                # seats are still found.
+                log.warn(
+                    "enterprise seats endpoint returned 0 seats; falling back to per-org "
+                    "discovery (Copilot may be managed at the org level)"
+                )
         except (GitHubError, AuthFailure) as exc:
             if getattr(exc, "status", None) in (403, 404):
                 log.warn("enterprise seats endpoint unavailable; falling back to per-org iteration")
@@ -226,6 +234,18 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
     )
     if skipped_orgs:
         log.warn(f"skipped {len(skipped_orgs)} org(s) without accessible Copilot billing")
+    if not all_seats:
+        msg = (
+            f"No Copilot seats found for enterprise '{cfg.enterprise_slug}'. Likely causes: "
+            "(1) the slug is an ORGANIZATION, not an enterprise — run with '--orgs <org>' instead of "
+            "'--enterprise'; (2) the enterprise slug is wrong or the token lacks access "
+            "(check github.com/enterprises/<slug> and that the token has manage_billing:copilot / "
+            "read:enterprise); (3) the seats were assigned AFTER the requested --billing-period "
+            f"('{cfg.resolve_billing_period()}') — try the current month, since the seats endpoint is "
+            "point-in-time."
+        )
+        log.warn(msg)
+        print(f"[copilot-aic-report] WARNING: {msg}", file=sys.stderr)
 
     # -- identities (enterprise-wide + per-org for orgs that HAVE seats) --
     identity_index: Dict[str, str] = {}

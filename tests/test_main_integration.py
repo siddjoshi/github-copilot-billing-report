@@ -428,6 +428,45 @@ def test_enterprise_seats_preferred_no_per_org_seat_calls(tmp_path, monkeypatch)
     assert rows[0]["org_login"] == "acme"  # org attribution from enterprise seat
 
 
+def test_empty_enterprise_seats_falls_back_to_per_org(tmp_path, monkeypatch):
+    # Enterprise seats endpoint returns 200 with 0 seats (Copilot managed at org level).
+    # The tool must fall back to per-org discovery and still find the seats.
+    class EmptyEntSession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(200, {"total_seats": 0, "seats": []}, headers={})
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": EmptyEntSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    log = cli.run(cfg)
+    assert log.rows_written == 1  # found via per-org fallback
+    assert any("returned 0 seats" in w for w in log.warnings)
+
+
+def test_no_seats_emits_actionable_diagnostic(tmp_path, monkeypatch):
+    # Enterprise empty AND no orgs discovered -> clear diagnostic, header-only CSV.
+    class NothingSession(RoutingSession):
+        def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+            if "/enterprises/" in url and "/copilot/billing/seats" in url:
+                return FakeResponse(200, {"total_seats": 0, "seats": []}, headers={})
+            if url.endswith("/graphql"):
+                q = (json or {}).get("query", "")
+                if "organizations" in q:
+                    return FakeResponse(200, {"data": {"enterprise": {"organizations": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [],
+                    }}}})
+            return super().request(method, url, params, json, headers, timeout)
+
+    holder = {"session": NothingSession()}
+    _patch_counting(monkeypatch, holder)
+    cfg = _make_cfg(tmp_path)
+    log = cli.run(cfg)
+    assert log.rows_written == 0
+    assert any("No Copilot seats found" in w for w in log.warnings)
+
+
 def test_suspended_guid_user_live_end_to_end(tmp_path, monkeypatch):
     # A suspended EMU user surfaces with a GUID login on the enterprise seats endpoint.
     guid = "2f1c8e4a-1234-4abc-9def-0123456789ab"
