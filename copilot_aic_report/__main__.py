@@ -385,7 +385,10 @@ def run(cfg: Config, allow_partial: bool = False) -> RunLog:
             log.warn(f"billing-usage fetch failed: {exc}")
 
     # -- per-user AIC consumption --
-    aic_holders = ledger.live_seat_holders()
+    # Query AIC for every user who held a license in the reported period(s), including
+    # seats that have since been removed/suspended — otherwise their consumption for a
+    # past month would be lost just because the seat is no longer active now.
+    aic_holders = ledger.seat_holders_for_periods(report_months)
     consumption_rows, consumption_source = aic_consumption.get_consumption(client, cfg, aic_holders)
     log.aic_consumption_source = consumption_source
     consumption_index = index_consumption(consumption_rows)
