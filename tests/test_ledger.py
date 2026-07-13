@@ -50,12 +50,23 @@ def test_live_seat_with_team():
 def test_pending_cancellation():
     led = SeatLedger()
     led.add_live_seat(_seat("mona", "acme", "2026-03-01T00:00:00Z", pending="2026-07-31T00:00:00Z"))
-    rows = led.materialize_month("2026-07", "now")
+    rows = led.materialize_month("2026-07", "2026-07-09T00:00:00Z")
     r = rows[0]
     assert r.seat_status == "pending_cancellation"
-    # A scheduled cancellation is "cancelled" -> inactive, with the revoke date shown.
     assert r.user_status == "inactive"
+    # user_revoked_date is populated for pending_cancellation seats — even when the
+    # scheduled cancellation date is in the future.
     assert r.user_revoked_date == "2026-07-31"
+
+
+def test_pending_cancellation_in_the_past_sets_revoked_date():
+    led = SeatLedger()
+    led.add_live_seat(_seat("mona", "acme", "2026-03-01T00:00:00Z", pending="2026-07-05T00:00:00Z"))
+    rows = led.materialize_month("2026-07", "2026-07-09T00:00:00Z")
+    r = rows[0]
+    assert r.seat_status == "pending_cancellation"
+    assert r.user_status == "inactive"
+    assert r.user_revoked_date == "2026-07-05"
 
 
 def test_audit_reconstructed_revoked():
@@ -95,16 +106,36 @@ def test_cancel_without_assign_predates_history():
     assert any("predates" in n for n in feb[0].notes)
 
 
-def test_pending_cancellation_future_cycle_still_sets_revoked_date():
-    # A pending cancellation scheduled beyond the current cycle end must still show
-    # the user as inactive WITH the scheduled revoke date (previously left empty).
+def test_pending_cancellation_future_date_still_shown():
+    # A pending cancellation scheduled in a future cycle is still surfaced with its
+    # scheduled date (user_revoked_date follows seat_status, not past/future).
     led = SeatLedger()
     led.add_live_seat(_seat("mona", "acme", "2026-03-01T00:00:00Z", pending="2026-09-30T00:00:00Z"))
-    rows = led.materialize_month("2026-07", "now")
+    rows = led.materialize_month("2026-07", "2026-07-09T00:00:00Z")
     r = rows[0]
     assert r.seat_status == "pending_cancellation"
     assert r.user_status == "inactive"
     assert r.user_revoked_date == "2026-09-30"
+
+
+def test_active_seat_has_no_revoked_date():
+    # Active seats never carry a revoke date.
+    led = SeatLedger()
+    led.add_live_seat(_seat("mona", "acme", "2026-03-01T00:00:00Z"))
+    rows = led.materialize_month("2026-07", "2026-07-09T00:00:00Z")
+    r = rows[0]
+    assert r.seat_status == "active"
+    assert r.user_revoked_date == ""
+
+
+def test_future_assigned_date_is_ignored():
+    # A license cannot be assigned in the future; a seat created_at later than the
+    # report generation time (clock skew / bad source data) must not surface as a
+    # future license_assigned_date. Use a date inside the reported cycle but after now.
+    led = SeatLedger()
+    led.add_live_seat(_seat("mona", "acme", "2026-07-20T00:00:00Z"))
+    rows = led.materialize_month("2026-07", "2026-07-09T00:00:00Z")
+    assert rows and rows[0].license_assigned_date == ""
 
 
 def test_audit_cfb_action_names_reconstruct_removed_user():

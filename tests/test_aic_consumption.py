@@ -74,7 +74,9 @@ def test_load_from_csv_missing_file_raises_source_unavailable(tmp_path):
         load_from_csv(missing, Config())
 
 
-def test_fetch_from_api_queries_enterprise_endpoint_and_sums_items():
+def test_fetch_from_api_prefers_enterprise_endpoint_and_sums_items():
+    # Backward-compatible: the enterprise-wide per-user endpoint is preferred when
+    # available; one org-agnostic call per user.
     client = FakeClient({"usageItems": [
         {"product": "copilot", "grossQuantity": 5, "grossAmount": 0.05},
         {"product": "copilot", "grossQuantity": 3, "grossAmount": 0.03},
@@ -89,10 +91,57 @@ def test_fetch_from_api_queries_enterprise_endpoint_and_sums_items():
     assert rows[0].credits_consumed == 8.0
     assert rows[0].usd_consumed == pytest.approx(0.08)
     assert rows[0].source == "api"
+    # Enterprise endpoint is used (and only once — the probe result is reused).
     assert client.calls == [(
         "/enterprises/my-ent/settings/billing/ai_credit/usage",
         {"year": 2026, "month": 7, "user": "dana"},
     )]
+
+
+def test_fetch_from_api_falls_back_to_org_when_enterprise_endpoint_absent():
+    # When the enterprise-level endpoint 404s (does not exist for this enterprise),
+    # the run falls back to the org-level per-user endpoint to still get data.
+    class RoutingClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None):
+            self.calls.append((path, params))
+            if path.startswith("/enterprises/"):
+                raise GitHubError("missing", status=404)
+            return {"usageItems": [{"grossQuantity": 7, "grossAmount": 0.07}]}
+
+    client = RoutingClient()
+    cfg = Config(enterprise_slug="my-ent", billing_period="2026-07", credit_to_usd=0.01)
+    rows = fetch_from_api(client, cfg, [("platform", "dana")])
+
+    assert len(rows) == 1
+    assert rows[0].user_login == "dana"
+    assert rows[0].credits_consumed == 7.0
+    paths = [p for p, _ in client.calls]
+    # Enterprise probed first (404), then org-level fallback used.
+    assert paths[0] == "/enterprises/my-ent/settings/billing/ai_credit/usage"
+    assert "/organizations/platform/settings/billing/ai_credit/usage" in paths
+
+
+def test_fetch_from_api_falls_back_to_org_when_enterprise_endpoint_forbidden():
+    # A 403 on the enterprise endpoint (e.g. IP allowlist) also triggers org fallback.
+    class ForbiddenEntClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None):
+            self.calls.append((path, params))
+            if path.startswith("/enterprises/"):
+                raise AuthFailure("forbidden", status=403)
+            return {"usageItems": [{"grossQuantity": 4, "grossAmount": 0.04}]}
+
+    client = ForbiddenEntClient()
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07", credit_to_usd=0.01)
+    rows = fetch_from_api(client, cfg, [("acme", "dana")])
+
+    assert [r.user_login for r in rows] == ["dana"]
+    assert rows[0].credits_consumed == 4.0
 
 
 def test_fetch_from_api_dedupes_logins_across_orgs():
@@ -123,7 +172,6 @@ def test_fetch_from_api_all_orgs_unavailable_raises():
     with pytest.raises(AicSourceUnavailable):
         fetch_from_api(FakeClient(exc=GitHubError("missing", status=404)),
                        Config(billing_period="2026-07"), [("org", "u")])
-
 
 def test_fetch_from_api_auth_failure_raises_unavailable():
     with pytest.raises(AicSourceUnavailable):
@@ -167,11 +215,81 @@ def test_fetch_from_api_all_auth_failures_still_raises_unavailable():
         fetch_from_api(AllFailClient(), cfg, [("org", "a"), ("org", "b")])
 
 
-def test_fetch_from_api_enterprise_endpoint_404_raises_unavailable():
-    # The enterprise endpoint is a single endpoint; a 404 means unavailable.
+def test_fetch_from_api_all_orgs_404_raises_unavailable():
+    # When every org's endpoint 404s and nothing is collected, the source is
+    # unavailable so callers can fall back to CSV.
     with pytest.raises(AicSourceUnavailable):
         fetch_from_api(FakeClient(exc=GitHubError("missing", status=404)),
                        Config(enterprise_slug="ent", billing_period="2026-07"), [("org", "x")])
+
+
+def test_fetch_from_api_one_dead_org_does_not_zero_other_orgs():
+    # Scaling isolation (org-fallback mode): after the enterprise endpoint 404s and
+    # the run falls back to org-level, a single org whose endpoint is 404 must NOT
+    # discard consumption collected from healthy orgs.
+    class MixedClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None):
+            self.calls.append((path, params))
+            if path.startswith("/enterprises/"):
+                raise GitHubError("missing", status=404)  # force org fallback
+            if path.startswith("/organizations/dead/"):
+                raise GitHubError("missing", status=404)
+            if (params or {}).get("user") == "alice":
+                return {"usageItems": [{"grossQuantity": 10, "grossAmount": 0.1}]}
+            return {"usageItems": []}
+
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07", credit_to_usd=0.01, aic_concurrency=1)
+    rows = fetch_from_api(
+        MixedClient(), cfg,
+        [("dead", "bob"), ("healthy", "alice")],
+    )
+    assert [r.user_login for r in rows] == ["alice"]
+    assert rows[0].credits_consumed == 10.0
+
+
+def test_fetch_from_api_user_not_found_does_not_abort_batch():
+    # THE BUG FIX: a per-user "User '…' not found" 404 must be treated as no data for
+    # that user, NOT as endpoint-death. One unknown login must not zero out everyone.
+    class NotFoundClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None):
+            self.calls.append((path, params))
+            user = (params or {}).get("user")
+            if user == "ghost":
+                raise GitHubError(
+                    "404 not found", status=404,
+                    body={"message": "User 'ghost' not found.", "status": "404"},
+                )
+            if user == "alice":
+                return {"usageItems": [{"grossQuantity": 10, "grossAmount": 0.1}]}
+            return {"usageItems": []}  # known user, no consumption
+
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07", credit_to_usd=0.01, aic_concurrency=1)
+    rows = fetch_from_api(NotFoundClient(), cfg, [("org", "ghost"), ("org", "alice"), ("org", "bob")])
+
+    assert [r.user_login for r in rows] == ["alice"]
+    assert rows[0].credits_consumed == 10.0
+
+
+def test_fetch_from_api_all_users_not_found_returns_empty_not_raise():
+    # If every user is a known 200-empty or per-user not-found (i.e. the endpoint works
+    # but nobody consumed), return [] rather than raising — this is genuine "no usage",
+    # not an unavailable source.
+    class MixedClient:
+        def get(self, path, params=None):
+            user = (params or {}).get("user")
+            if user == "ghost":
+                raise GitHubError("404", status=404, body={"message": "User 'ghost' not found."})
+            return {"usageItems": []}
+
+    cfg = Config(enterprise_slug="ent", billing_period="2026-07", aic_concurrency=1)
+    rows = fetch_from_api(MixedClient(), cfg, [("org", "ghost"), ("org", "known")])
+    assert rows == []  # endpoint answered (200s seen) -> no consumption, not unavailable
 
 
 def test_fetch_from_api_no_holders_returns_empty():

@@ -79,14 +79,31 @@ limited tokens; pass `--orgs` to scope to specific organizations.
 
 ### Per-user AI-credit consumption performance
 
-Per-user AIC consumption comes from
-`GET /enterprises/{ent}/settings/billing/ai_credit/usage?user={login}` — one call per
-user. For large enterprises this is fetched concurrently (`aic_concurrency`, default 8).
-For deprovisioned EMU users whose seat carries only an obfuscated login, the lookup
-retries best-effort with the permanent numeric `github_user_id` (`?user={id}`) so their
-usage is still captured. For the fastest bulk load, export the premium-request/AI-credit
-report from the billing UI and pass it with `--aic-csv` (also required for accurate
-historical months).
+Per-user AIC consumption is loaded from GitHub's per-user AI-credit report, trying
+two endpoints in order:
+
+1. **Enterprise (preferred):** `GET /enterprises/{ent}/settings/billing/ai_credit/usage?user={login}`
+   — one org-agnostic call per user. This remains the primary source, so environments
+   where it is available keep working unchanged.
+2. **Organization (fallback, only when needed):**
+   `GET /organizations/{org}/settings/billing/ai_credit/usage?user={login}` — used only
+   when the enterprise endpoint is unavailable/forbidden (e.g. it doesn't exist for the
+   enterprise or is IP-blocked). The org report's `usageItems` carry no per-user field,
+   so the `?user=` filter is required.
+
+The enterprise endpoint is the primary source; each unique user is queried once. The
+`?user=` filter returns `404 "User '…' not found"` for logins the billing system does not
+know (e.g. audit-reconstructed or deprovisioned handles) and `200` with an empty
+`usageItems` for known users with no consumption. **A per-user 404 is treated as "no data
+for that user", never as endpoint failure** — so one unknown login can't zero out everyone
+(a bug this previously caused). The run falls back to the org-level endpoint only when the
+enterprise endpoint is genuinely unusable (every call fails). For large enterprises (10k+
+users) calls are issued concurrently (`aic_concurrency`, default 8) and the client backs
+off on primary/secondary rate limits. For deprovisioned EMU users whose seat carries only
+an obfuscated login, the lookup retries best-effort with the permanent numeric
+`github_user_id` (`?user={id}`). For the fastest bulk load, export the
+premium-request/AI-credit report from the billing UI and pass it
+with `--aic-csv` (also required for accurate historical months).
 
 ---
 
@@ -116,7 +133,7 @@ Required columns (fixed order), then recommended/provenance columns.
 | `gh_copilot_license_cost` | `license_cost_table[plan_type]` (negotiated/config). Org-level actuals from billing-usage are logged. |
 | `default_aic_user_level` | Date-aware `default_aic_table[plan_type]` (credits). `default_aic_usd` = credits × `credit_to_usd`. |
 | `aic_billing_dollar_assigned` | Per-user budget if configured, else `default_aic_user_level × 0.01`. Rule recorded in `aic_assigned_rule_used`. |
-| `aic_consumed` | Per-user **gross** AI-credits consumed from `.../ai_credit/usage?user=` (`grossQuantity`), plus `aic_consumed_usd` (`grossAmount`, falling back to `grossQuantity × credit_to_usd` when `grossAmount` is absent). This is credits *used*, not the net *billed* amount — usage within the included allowance still counts here even though it bills $0. `0` if none; empty for historical months with no per-user data. |
+| `aic_consumed` | Per-user **gross** AI-credits consumed from the AI-credit report (`.../ai_credit/usage?user=`, `grossQuantity`), plus `aic_consumed_usd` (`grossAmount`, falling back to `grossQuantity × credit_to_usd` when `grossAmount` is absent). This is credits *used*, not the net *billed* amount — usage within the included allowance still counts here even though it bills $0. `0` if none; empty for historical months with no per-user data. |
 | `user_status` | `active` = holds a valid, non-cancelled license; else `inactive` (removed / pending_cancellation / suspended / deprovisioned). |
 | `user_revoked_date` | `pending_cancellation_date` if set (including cancellations scheduled for a future cycle), else latest cancel event from audit (`copilot.cfb_seat_cancelled` / `cfb_seat_assignment_unassigned` / `access_revoked` / legacy `seat_cancelled`), else the SCIM deprovisioning timestamp (`meta.lastModified`) for suspended/deprovisioned accounts; empty only if active/never-revoked. |
 | `org_login` | Instance (org) login. |

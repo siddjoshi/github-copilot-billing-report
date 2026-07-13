@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .models import AuditEvent, Seat
 from .periods import cycle_bounds_utc, interval_overlaps_period
@@ -265,6 +265,58 @@ class SeatLedger:
                 out.append((holder.org, holder.login, holder.user_id))
         return out
 
+    def seat_holders_for_periods(self, periods: Iterable[str]) -> List[tuple]:
+        """Return ``(org, login, user_id, query_login)`` for every holder with a login
+        whose seat interval overlaps any of the given billing periods.
+
+        Unlike :meth:`live_seat_holders`, this also includes seats that have since
+        been **removed/suspended** — as long as the user held a license during one of
+        the reported months — so their per-user AIC consumption for that month is still
+        queried and not lost just because the seat is no longer active now.
+
+        ``query_login`` is the **original seat login** (the obfuscated handle the seats
+        API / audit log returns for EMU users), which is what the billing AI-credit
+        endpoint keys usage by. It differs from ``login`` when the login was resolved
+        to a real handle via audit/identity data — querying that resolved handle
+        returns "User not found", so consumption must be fetched with the original
+        seat login while still being attributed to ``login`` (the report's display
+        login) so it matches the materialized row.
+        """
+        period_list = [p for p in periods if p]
+        out: List[tuple] = []
+        seen: set = set()
+        for holder in self._unique_holders():
+            if not holder.login:
+                continue
+            intervals = self._intervals_for(holder)
+            if not any(
+                interval_overlaps_period(iv.assigned_at, iv.revoked_at, period)
+                for period in period_list
+                for iv in intervals
+            ):
+                continue
+            key = (holder.org, str(holder.login).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((holder.org, holder.login, holder.user_id, self._aic_query_login(holder)))
+        return out
+
+    @staticmethod
+    def _aic_query_login(holder: "_Holder") -> Optional[str]:
+        """The original seat login billing keys AIC by (obfuscated for EMU users).
+
+        Prefer the live seat's raw ``assignee_login`` (always the original handle even
+        after the report login was resolved to a real name), else the obfuscated login
+        captured on the holder's ``external_identity`` (set for audit-reconstructed
+        deprovisioned users), else the login itself.
+        """
+        seat = holder.live_seat
+        if seat is not None and getattr(seat, "assignee_login", None):
+            return seat.assignee_login
+        return holder.external_identity or holder.login
+
+
     def user_id_login_index(self) -> Dict[int, str]:
         """Map numeric GitHub user id -> real (non-obfuscated) login, built from
         every holder that has both. Used to recover the real login of a
@@ -352,6 +404,10 @@ class SeatLedger:
         now_iso: str,
     ) -> MaterializedSeat:
         seat = interval.seat
+        # "Today" (report generation date, UTC) — used to guard license_assigned_date
+        # against future values (a license cannot be assigned in the future).
+        _now = to_utc_datetime(now_iso)
+        today_iso = _now.date().isoformat() if _now is not None else ""
         # Revoked within/at this month?
         revoked_date = ""
         seat_status = "active"
@@ -373,6 +429,12 @@ class SeatLedger:
             # A scheduled cancellation is a revocation even when it falls in a future
             # cycle; surface its date so revoked users always carry a revoke date.
             revoked_date = interval.pending_cancellation_at.date().isoformat()
+
+        # user_revoked_date follows the seat's revocation state: it is populated for
+        # seats that are pending_cancellation or removed (whether the effective date is
+        # in the past or a scheduled future date), and stays blank for active seats
+        # (which never set it above). It is intentionally NOT blanked for future dates,
+        # so a scheduled cancellation still surfaces its date.
 
         if interval.origin == "live_seat":
             row_source = "live_seats"
@@ -396,6 +458,11 @@ class SeatLedger:
             notes.append("account suspended/deprovisioned (GUID placeholder login)")
 
         assigned_date = interval.assigned_at.date().isoformat() if interval.assigned_at else ""
+        # A license cannot be assigned in the future; guard against clock-skew / bad
+        # source timestamps so license_assigned_date never shows a future date.
+        if assigned_date and today_iso and assigned_date > today_iso:
+            assigned_date = ""
+            notes.append("assignment date in the future ignored")
         if interval.assigned_at is None:
             notes.append("assignment predates available history window")
             history_confidence = "reconstructed"
